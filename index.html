@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1211" id="themeColorMeta">
+<title>Штаб Абхазии — Оперативно-стратегическая карта</title>
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script>
+(function(){
+  try {
+    var saved = localStorage.getItem('abkhazia_atlas_theme');
+    var dark = saved ? saved === 'dark' : true;
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+    var m = document.getElementById('themeColorMeta');
+    if (m) m.setAttribute('content', dark ? '#0d1211' : '#f4f3ec');
+  } catch (e) {}
+})();
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="war-mode">
+<header>
+  <a class="identity" href="#map" id="brandHome" aria-label="Штаб Абхазии, общий вид">
+    <img src="assets/mark.svg" alt="">
+    <span class="brandText">
+      <strong>Штаб Абхазии</strong>
+      <small>Оперативно-стратегический центр</small>
+    </span>
+  </a>
+
+  <div class="headerActions">
+    <button class="themeBtn onlineBtn" id="onlineToggle" type="button" aria-label="Онлайн-матч 1 на 1" title="Пригласить друга по ссылке (Supabase)">
+      <span class="onlineDot" id="onlineDot" aria-hidden="true"></span>
+      <span id="onlineLabel">Онлайн 1×1</span>
+    </button>
+    <button class="themeBtn" id="guideToggle" type="button" aria-label="Как играть и режим вдвоём" title="Инструкция и игра вдвоём · H">
+      <span class="guideDot" aria-hidden="true">?</span>
+      <span>Как играть</span>
+    </button>
+    <button class="themeBtn" id="themeToggle" type="button" aria-label="Переключить тему оформления" title="Сменить тему · T">
+      <span class="themeIcon" id="themeIcon" data-icon="sun"></span>
+      <span class="themeLabel" id="themeLabel">Светлая</span>
+    </button>
+  </div>
+</header>
+
+<main id="layout">
+  <aside id="side" aria-label="Панель командования">
+    <div id="warSideContent" class="sideSlot"></div>
+  </aside>
+
+  <section id="map" tabindex="0" aria-label="Тактическая карта Абхазии">
+    <canvas id="canvas" aria-hidden="true"></canvas>
+
+    <div id="warHud" class="warHud"></div>
+    <div id="warLensBar" class="warLensBar" hidden></div>
+    <div id="warHoverTip" class="warHoverTip" hidden></div>
+    <div id="eventOverlay" class="eventOverlay" hidden></div>
+    <div id="victoryOverlay" class="eventOverlay" hidden></div>
+
+    <div class="mapHeader">
+      <button class="mapBtn iconOnly" id="sidebarToggle" data-action="side" type="button" aria-label="Свернуть или открыть панель" title="Боковая панель · B" data-icon="sidebar"></button>
+      <button class="mapBtn iconOnly" id="layerButton" type="button" aria-expanded="false" aria-controls="layers" aria-label="Слои карты" title="Слои и рельеф карты">
+        <span data-icon="layers"></span>
+      </button>
+    </div>
+
+    <div id="layers" class="floating" hidden>
+      <div class="panelTitleRow">
+        <h3>Слои карты</h3>
+        <span class="panelBadge">HD</span>
+      </div>
+      <div class="presetGroup" role="group" aria-label="Стиль карты">
+        <button class="presetBtn active" type="button" data-preset="atlas">Рельеф</button>
+        <button class="presetBtn" type="button" data-preset="topo">Топо</button>
+        <button class="presetBtn" type="button" data-preset="scheme">Схема</button>
+      </div>
+      <div id="layerItems"></div>
+    </div>
+
+    <div class="mapTools">
+      <button class="mapBtn iconOnly" id="home" type="button" aria-label="Показать всю Абхазию" title="Вся карта · Home" data-icon="fit"></button>
+      <div class="zoom">
+        <button class="mapBtn" id="zoomIn" type="button" aria-label="Приблизить" title="Приблизить · +" data-icon="plus"></button>
+        <div class="zoomReadout" id="zoomLevel" title="Текущее увеличение">1.0×</div>
+        <button class="mapBtn" id="zoomOut" type="button" aria-label="Отдалить" title="Отдалить · −" data-icon="minus"></button>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <div class="statusbar">
+      <div class="statusLeft">
+        <div class="scale">
+          <span id="scaleText"></span>
+          <b id="scaleLine"></b>
+        </div>
+        <span class="statusSep" aria-hidden="true"></span>
+        <span id="zoomStatus" class="statusMono"></span>
+      </div>
+      <span id="position" class="statusMono"></span>
+      <span class="statusMono statusBrand">Штаб Абхазии</span>
+    </div>
+  </section>
+</main>
+
+<dialog id="dialog">
+  <div class="dialogHead">
+    <h2 id="dialogTitle"></h2>
+    <button class="iconButton" id="dialogClose" type="button" aria-label="Закрыть" data-icon="close"></button>
+  </div>
+  <div id="dialogBody"></div>
+</dialog>
+
+<!-- Картографический движок и данные рельефа -->
+<script src="data/base.js"></script>
+<script src="data/buildings.js"></script>
+<script src="data/terrain.js"></script>
+<script src="data/fine.js"></script>
+<script src="data/points.js"></script>
+<script src="data/overview.js"></script>
+<script src="data/contours.js"></script>
+<script src="icons.js"></script>
+<script src="map.js"></script>
+<script src="script.js"></script>
+
+<!-- Модули стратегической игры -->
+<script src="game/sectors/sectors.js"></script>
+<script src="game/sectors/routes.js"></script>
+<script src="game/units/equipment.js"></script>
+<script src="game/diplomacy/sponsors.js"></script>
+<script src="game/scenarios/01_gumista_split.js"></script>
+<script src="game/scenarios/02_palace_coup.js"></script>
+<script src="game/scenarios/03_kodori_gorge.js"></script>
+<script src="game/scenarios/04_tkuarchal_siege.js"></script>
+<script src="game/scenarios/05_gagra_corridor.js"></script>
+<script src="game/scenarios/06_sukhum_storm.js"></script>
+<script src="game/scenarios/07_gal_ingur.js"></script>
+<script src="game/scenarios/08_mountain_shield.js"></script>
+<script src="game/scenarios/09_gudauta_standoff.js"></script>
+<script src="game/scenarios/10_ports_blockade.js"></script>
+<script src="game/scenarios/11_strange_war.js"></script>
+<script src="game/scenarios/12_total_escalation.js"></script>
+<script src="game/scenarios/13_korean_line.js"></script>
+<script src="game/scenarios/14_russian_peacekeepers.js"></script>
+<script src="game/scenarios/15_southern_corridor.js"></script>
+<script src="game/scenarios/16_winter_stalemate.js"></script>
+<script src="game/scenarios/17_coast_vs_mountains.js"></script>
+<script src="game/scenarios/18_diplomatic_freeze.js"></script>
+<script src="game/scenarios/index.js"></script>
+
+<!-- База динамических событий (240 событий) -->
+<script src="game/events/01_world_powers.js"></script>
+<script src="game/events/02_secret_ops.js"></script>
+<script src="game/events/03_un_diplomacy.js"></script>
+<script src="game/events/04_frontline_war.js"></script>
+<script src="game/events/05_homefront_society.js"></script>
+<script src="game/events/06_regional_actors.js"></script>
+<script src="game/events/07_propaganda_interventions.js"></script>
+<script src="game/events/index.js"></script>
+
+<!-- Защищённый онлайн-мультиплеер (Supabase Realtime + RPC) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js"></script>
+<script src="game/net/supabase_config.js"></script>
+<script src="game/net/supabase_client.js"></script>
+<script src="game/engine/engine.js"></script>
+<script src="game/ui/warroom.js"></script>
+</body>
+</html>

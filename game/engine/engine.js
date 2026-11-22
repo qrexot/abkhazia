@@ -17,6 +17,7 @@ window.AbkhaziaGame.Engine = (() => {
   let pvpSide = 'A';    // 'A' | 'B' | 'UN'
   let speed = 1;        // 0 | 1 | 2 | 4
   let loopId = null;
+  let backgroundHostTimer = null;
   let lastTick = 0;
   let hourAccum = 0;
   let aiHourCounter = 0;
@@ -1072,27 +1073,33 @@ window.AbkhaziaGame.Engine = (() => {
   }
 
   // ==================== REAL-TIME LOOP ====================
+  function advanceClock(now, maxElapsed) {
+    const dt = Math.min(maxElapsed, (now - lastTick) / 1000);
+    lastTick = now;
+    if (!state || state.status === 'finished' || onlineMode === 'guest') return;
+    const pending = state.pendingEvent;
+    if (pending && Date.now() >= pending.expiresAt) {
+      const choices = pending.event.choices;
+      const neutral = choices.findIndex(choice => !choice.eff || Object.keys(choice.eff).length === 0);
+      const fallback = pending.treaty || neutral < 0 ? choices.length - 1 : neutral;
+      for (const [side, answer] of Object.entries(pending.answers)) {
+        if (answer === null) resolvePendingEvent(side, pending.key, fallback, true);
+      }
+      if (onlineMode === 'host') G.SupabaseNet?.pushSnapshot(state, true);
+    }
+    if (speed === 0) return;
+    for (let remaining = dt; remaining > 0 && speed > 0; remaining -= 0.08) {
+      stepRealTime(Math.min(remaining, 0.08) * speed, now);
+    }
+  }
+
   function startLoop() {
     if (loopId) return;
     lastTick = performance.now();
     const tick = now => {
       loopId = requestAnimationFrame(tick);
-      if (now - lastTick < 30 && onlineMode === 'host') return;
-      const dt = Math.min(0.08, (now - lastTick) / 1000);
-      lastTick = now;
-      if (!state || state.status === 'finished' || onlineMode === 'guest') return;
-      const pending = state.pendingEvent;
-      if (pending && Date.now() >= pending.expiresAt) {
-        const choices = pending.event.choices;
-        const neutral = choices.findIndex(choice => !choice.eff || Object.keys(choice.eff).length === 0);
-        const fallback = pending.treaty || neutral < 0 ? choices.length - 1 : neutral;
-        for (const [side, answer] of Object.entries(pending.answers)) {
-          if (answer === null) resolvePendingEvent(side, pending.key, fallback, true);
-        }
-        if (onlineMode === 'host') G.SupabaseNet?.pushSnapshot(state, true);
-      }
-      if (speed === 0) return;
-      stepRealTime(dt * speed, now);
+      if (onlineMode === 'host' && (document.hidden || now - lastTick < 30)) return;
+      advanceClock(now, onlineMode === 'host' ? 0.18 : 0.08);
     };
     loopId = requestAnimationFrame(tick);
   }
@@ -2925,6 +2932,14 @@ window.AbkhaziaGame.Engine = (() => {
   // ==================== ANTI-CHEAT ONLINE MULTIPLAYER HOOKS ====================
   function setOnlineMode(mode, lockedSide) {
     onlineMode = mode || null;
+    if (onlineMode === 'host' && !backgroundHostTimer) {
+      backgroundHostTimer = setInterval(() => {
+        if (document.hidden) advanceClock(performance.now(), 1.25);
+      }, 250);
+    } else if (onlineMode !== 'host' && backgroundHostTimer) {
+      clearInterval(backgroundHostTimer);
+      backgroundHostTimer = null;
+    }
     if (onlineMode && (lockedSide === 'A' || lockedSide === 'B')) {
       role = lockedSide;
     }

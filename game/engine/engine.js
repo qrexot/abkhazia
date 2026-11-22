@@ -24,6 +24,7 @@ window.AbkhaziaGame.Engine = (() => {
   let eventHourCounter = 0;
   let usedEventIds = new Set();
   let uidSeq = 1;
+  const divisionMotion = new WeakMap();
 
   const AI_PERSONALITIES = ['blitz_coast', 'mountain_flank', 'artillery_attrition', 'deep_raid', 'opportunist'];
 
@@ -1136,6 +1137,7 @@ window.AbkhaziaGame.Engine = (() => {
 
     // 1. Continuous On-Road / On-Rail Division Movement, Obstacle Handling & Entrenchment
     for (const d of state.divisions) {
+      if (onlineMode === 'host') divisionMotion.delete(d);
       d.inCombat = false;
       d.onRail = false;
       d.onSea = false;
@@ -1247,8 +1249,13 @@ window.AbkhaziaGame.Engine = (() => {
             if (d.order.path && d.order.path.length > 1) d.order.path.shift();
             else d.order = null;
           } else {
-            d.x += (dx / dd) * moveSpeed * simDt;
-            d.y += (dy / dd) * moveSpeed * simDt;
+            const vx = (dx / dd) * moveSpeed;
+            const vy = (dy / dd) * moveSpeed;
+            d.x += vx * simDt;
+            d.y += vy * simDt;
+            if (onlineMode === 'host') {
+              divisionMotion.set(d, { x: d.x, y: d.y, vx, vy, target: wp, order: d.order });
+            }
             d.fort = Math.max(0, d.fort - 0.04 * simDt);
           }
         }
@@ -2946,6 +2953,22 @@ window.AbkhaziaGame.Engine = (() => {
     emit();
   }
 
+  function getMotionFrame() {
+    const precise = n => Math.round(n * 100) / 100;
+    return {
+      units: state.divisions.map(unit => {
+        const position = [unit.id, precise(unit.x), precise(unit.y)];
+        const movement = speed && divisionMotion.get(unit);
+        if (movement && unit.order === movement.order && unit.x === movement.x && unit.y === movement.y) {
+          position.push(precise(movement.vx * speed), precise(movement.vy * speed),
+            precise(movement.target.x), precise(movement.target.y));
+        }
+        return position;
+      }),
+      strikes: state.activeStrikes.map(strike => [strike.id, Math.round(strike.progress * 1000) / 1000, speed * 0.65])
+    };
+  }
+
   function applyRemoteState(snapshot, roomRow) {
     if (!snapshot || !snapshot.scenarioId) return;
     const prevPopups = (state && state.popups) ? state.popups : [];
@@ -3078,6 +3101,7 @@ window.AbkhaziaGame.Engine = (() => {
     initScenario,
     setOnlineMode,
     getOnlineMode: () => onlineMode,
+    getMotionFrame,
     applyRemoteState,
     executeRemoteCommand,
 

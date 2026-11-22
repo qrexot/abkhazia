@@ -2,6 +2,9 @@
 const AtlasMap = (() => {
   const canvas = document.getElementById('canvas');
   const box = document.getElementById('map');
+  const overlayCanvas = document.getElementById('warCanvas');
+  const overlayContext = overlayCanvas?.getContext('2d');
+  let redrawBase = true;
   const ctx = canvas.getContext('2d', { alpha: false });
   const W = 2816, H = 2048, S = 262144;
 
@@ -316,6 +319,11 @@ const AtlasMap = (() => {
   }
 
   function request() {
+    redrawBase = true;
+    requestOverlay();
+  }
+
+  function requestOverlay() {
     if (!frame) frame = requestAnimationFrame(draw);
   }
 
@@ -386,6 +394,10 @@ const AtlasMap = (() => {
     ratio = Math.min(window.devicePixelRatio || 1, 2);
     canvas.width = Math.round(width * ratio);
     canvas.height = Math.round(height * ratio);
+    if (overlayCanvas) {
+      overlayCanvas.width = canvas.width;
+      overlayCanvas.height = canvas.height;
+    }
     snapW = Math.round(width * OVERSCAN);
     snapH = Math.round(height * OVERSCAN);
     snap.width = Math.round(snapW * ratio);
@@ -694,6 +706,11 @@ const AtlasMap = (() => {
   function draw(time) {
     frame = 0;
     const P = PALETTES[theme];
+    if (!redrawBase && overlayContext) {
+      drawOverlay(time, P);
+      return;
+    }
+    redrawBase = false;
 
     if (motion) {
       const t = clamp((time - motion.start) / motion.duration, 0, 1);
@@ -738,8 +755,7 @@ const AtlasMap = (() => {
 
     if (layers.grid) drawGrid(v, P);
     drawCachedLabels(P, interacting);
-    if (overlayDrawer) overlayDrawer(ctx, { screen, world, view, width, height, theme });
-    if (measureMode || measurePoints.length) drawMeasure(P);
+    drawOverlay(time, P);
 
     // Dirty-checked DOM updates
     const lat = geographic(view.x, view.y)[1];
@@ -768,6 +784,14 @@ const AtlasMap = (() => {
       if (zoomStatusEl) zoomStatusEl.textContent = 'Масштаб ' + zoomStr;
       viewCallback({ z, relZoom });
     }
+  }
+
+  function drawOverlay(time, palette) {
+    const layer = overlayContext || ctx;
+    layer.setTransform(ratio, 0, 0, ratio, 0, 0);
+    if (overlayContext) layer.clearRect(0, 0, overlayCanvas.width / ratio, overlayCanvas.height / ratio);
+    if (overlayDrawer) overlayDrawer(layer, { screen, world, view, width, height, theme, time });
+    if (measureMode || measurePoints.length) drawMeasure(palette, layer);
   }
 
   function drawGrid(v, P) {
@@ -986,7 +1010,7 @@ const AtlasMap = (() => {
     }
   }
 
-  function drawMeasure(P) {
+  function drawMeasure(P, ctx) {
     if (!measurePoints.length) return;
     const pts = measurePoints.map(p => screen(p[0], p[1]));
     ctx.save();
@@ -1265,6 +1289,6 @@ const AtlasMap = (() => {
     setOverlay: fn => { overlayDrawer = fn; request(); },
     setClickInterceptor: fn => { clickInterceptor = fn; },
     flyTo: (x, y, z) => move({ x, y, z: z || Math.max(baseZoom * 2.2, 2.2) }, true),
-    redrawOverlay: () => request()
+    redrawOverlay: requestOverlay
   };
 })();

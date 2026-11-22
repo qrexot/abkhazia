@@ -11,6 +11,9 @@ window.AbkhaziaGame = window.AbkhaziaGame || {};
 window.AbkhaziaGame.SupabaseNet = (() => {
   const CFG_KEY = 'abkhazia_supabase_cfg_v2';
   const SESSION_KEY = 'abkhazia_online_session_v2';
+  const MOTION_EVENT = 'unit-positions-v1';
+  const SIGN_ALGORITHM = { name: 'ECDSA', hash: 'SHA-256' };
+  const textEncoder = new TextEncoder();
 
   let client = null;
   let channel = null;
@@ -26,6 +29,15 @@ window.AbkhaziaGame.SupabaseNet = (() => {
   let roomGeneration = 0;
   let roomEventReceivedAt = 0;
   let lastCommandRecoveryAt = 0;
+  let motionTimer = null;
+  let getHostMotion = null;
+  let motionSigner = null;
+  let motionVerifier = null;
+  let motionPublicKey = null;
+  let motionSendBusy = false;
+  let motionSeq = 0;
+  let lastMotionSeq = 0;
+  let lastMotionBody = null;
 
   let session = null; // { matchId, roomCode, side: 'A'|'B', token, scenarioId, scenarioTitle, status, hostName, guestName, speed, pausedBy }
   let localSeq = 0;
@@ -36,6 +48,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
   let onStatusChange = () => {};
   let onRemoteCommand = () => {};
   let onRemoteSnapshot = () => {};
+  let onRemoteMotion = () => {};
   let onRoomUpdate = () => {};
   let onSyncError = () => {};
   let lastReportedError = '';
@@ -148,6 +161,13 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     pollInFlight = null;
     roomEventReceivedAt = 0;
     lastCommandRecoveryAt = 0;
+    motionSigner = null;
+    motionVerifier = null;
+    motionPublicKey = null;
+    motionSendBusy = false;
+    motionSeq = 0;
+    lastMotionSeq = 0;
+    lastMotionBody = null;
     lastRoomUpdate = '';
     lastPublished = null;
     lastReportedError = '';
@@ -176,11 +196,16 @@ window.AbkhaziaGame.SupabaseNet = (() => {
       channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'online_commands', filter: 'match_id=eq.' + matchId }, ({ new: cmd }) => {
         if (roomGeneration === generation) handleIncomingCommand(cmd);
       });
+    } else {
+      channel.on('broadcast', { event: MOTION_EVENT }, ({ payload }) => receiveMotion(payload));
     }
     channel.subscribe(status => {
       if (roomGeneration !== generation) return;
       realtimeReady = status === 'SUBSCRIBED';
-      if (realtimeReady) poll();
+      if (realtimeReady) {
+        lastMotionBody = null;
+        poll();
+      }
     });
 
     function poll() {
@@ -210,7 +235,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
         if (roomGeneration !== generation) return;
         pollInFlight = null;
         if (session.status === 'finished') return;
-        pollTimer = setTimeout(poll, realtimeReady ? 2100 : 1100);
+        pollTimer = setTimeout(poll, realtimeReady ? 2100 : (isHost || session.status !== 'active' ? 1100 : 750));
       });
       return pollInFlight;
     }
@@ -238,6 +263,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
 
     if (session.side === 'B' && row.state_json?.scenarioId && row.seq > lastAppliedSeq) {
       lastAppliedSeq = Number(row.seq);
+      watchMotionKey(row.state_json.motionPublicKey);
       onRemoteSnapshot(row.state_json, row);
     }
   }
@@ -346,6 +372,85 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     }
   }
 
+  function encodeBytes(bytes) {
+    return btoa(String.fromCharCode(...new Uint8Array(bytes)));
+  }
+
+  function decodeBytes(base64) {
+    return Uint8Array.from(atob(base64), byte => byte.charCodeAt(0));
+  }
+
+  async function createMotionSigner(generation) {
+    if (!globalThis.crypto?.subtle) return;
+    try {
+      const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+      const publicKey = encodeBytes(await crypto.subtle.exportKey('raw', keys.publicKey));
+      if (roomGeneration === generation && motionTimer) motionSigner = { publicKey, key: keys.privateKey };
+    } catch (error) {
+      // Positions also arrive with the authenticated room snapshot.
+    }
+  }
+
+  function watchMotionKey(value) {
+    const key = typeof value === 'string' && value.length === 88 ? value : null;
+    if (motionPublicKey === key) return;
+    motionPublicKey = key;
+    lastMotionSeq = 0;
+    motionVerifier = null;
+    if (!key || !globalThis.crypto?.subtle) return;
+    try {
+      motionVerifier = crypto.subtle.importKey('raw', decodeBytes(key),
+        { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']).catch(() => null);
+    } catch (error) {}
+  }
+
+  function motionMessage(matchId, seq, body) {
+    return textEncoder.encode(matchId + ':' + seq + ':' + body);
+  }
+
+  async function sendMotion() {
+    if (!realtimeReady || session?.status !== 'active' || !motionSigner || motionSendBusy || !getHostMotion) return;
+    const body = JSON.stringify(getHostMotion());
+    if (body === lastMotionBody || body.length > 40000) return;
+    const generation = roomGeneration;
+    const seq = ++motionSeq;
+    motionSendBusy = true;
+    try {
+      const signature = await crypto.subtle.sign(SIGN_ALGORITHM, motionSigner.key,
+        motionMessage(session.matchId, seq, body));
+      if (roomGeneration !== generation || !realtimeReady || session?.status !== 'active') return;
+      const result = await channel.send({
+        type: 'broadcast', event: MOTION_EVENT, payload: { seq, body, signature: encodeBytes(signature) }
+      });
+      if (roomGeneration === generation && result === 'ok') lastMotionBody = body;
+    } catch (error) {
+      // The authoritative snapshot is the fallback when Realtime is unavailable.
+    } finally {
+      if (roomGeneration === generation) motionSendBusy = false;
+    }
+  }
+
+  async function receiveMotion(packet) {
+    if (session?.status !== 'active' || !session.speed || !motionVerifier || !packet ||
+        !Number.isSafeInteger(packet.seq) || packet.seq <= lastMotionSeq ||
+        typeof packet.body !== 'string' || packet.body.length > 40000 ||
+        typeof packet.signature !== 'string' || packet.signature.length !== 88) return;
+    const generation = roomGeneration;
+    const verifier = motionVerifier;
+    try {
+      const key = await verifier;
+      if (!key || roomGeneration !== generation || verifier !== motionVerifier) return;
+      const valid = await crypto.subtle.verify(SIGN_ALGORITHM, key, decodeBytes(packet.signature),
+        motionMessage(session.matchId, packet.seq, packet.body));
+      if (!valid || roomGeneration !== generation || verifier !== motionVerifier ||
+          session?.status !== 'active' || !session.speed || packet.seq <= lastMotionSeq) return;
+      const frame = JSON.parse(packet.body);
+      if (!Array.isArray(frame.units) || !Array.isArray(frame.strikes)) return;
+      lastMotionSeq = packet.seq;
+      onRemoteMotion(frame);
+    } catch (error) {}
+  }
+
   function pushSnapshot(state, immediate = false) {
     if (!client || session?.side !== 'A' || session.status !== 'active' || !state) return;
     queuedState = state;
@@ -363,7 +468,11 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     const generation = roomGeneration;
     const state = queuedState;
     queuedState = null;
-    const compact = { ...state, popups: [] };
+    const compact = {
+      ...state, popups: [],
+      motionPublicKey: motionSigner?.publicKey || null,
+      motionUnits: getHostMotion?.().units.filter(unit => unit.length === 7) || []
+    };
     const signature = JSON.stringify(compact);
     const ackBatch = [...pendingAckIds].slice(0, 30);
     if (!ackBatch.length && signature === lastPublished) return;
@@ -420,9 +529,14 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     onSyncError(message);
   }
 
-  function startHostSyncLoop(getStateFn) {
+  function startHostSyncLoop(getStateFn, getMotionFn) {
     if (pushTimer) return;
     pushTimer = setInterval(() => pushSnapshot(getStateFn()), 550);
+    getHostMotion = getMotionFn || null;
+    if (getHostMotion) {
+      motionTimer = setInterval(sendMotion, 100);
+      createMotionSigner(roomGeneration);
+    }
   }
 
   function stopHostSyncLoop() {
@@ -430,6 +544,9 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     clearTimeout(pushSoon);
     pushTimer = null;
     pushSoon = null;
+    clearInterval(motionTimer);
+    motionTimer = null;
+    getHostMotion = null;
   }
 
   async function setOnlineSpeed(spd) {
@@ -476,6 +593,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
       localSeq = Number(fullRoom.seq) || 0;
       lastAppliedSeq = localSeq;
       lastRoomUpdate = fullRoom.updated_at || '';
+      if (row.side === 'B') watchMotionKey(fullRoom.state_json?.motionPublicKey);
       return { ...session, stateJson: fullRoom.state_json };
     } catch (e) {
       return null;
@@ -523,6 +641,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     onStatus: fn => { onStatusChange = fn; },
     onCommand: fn => { onRemoteCommand = fn; },
     onSnapshot: fn => { onRemoteSnapshot = fn; },
+    onMotion: fn => { onRemoteMotion = fn; },
     onRoom: fn => { onRoomUpdate = fn; }
   };
 })();

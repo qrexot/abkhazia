@@ -4,6 +4,31 @@ window.AbkhaziaGame = window.AbkhaziaGame || {};
 window.AbkhaziaGame.WarRoom = (() => {
   const G = window.AbkhaziaGame;
   const E = G.Engine;
+  const guestMotion = G.createGuestMotion();
+  let guestMatchId = null;
+  let lastMapDrawTime = 0;
+
+  function syncGuestMotion(session) {
+    const matchId = session?.side === 'B' ? session.matchId : null;
+    if (matchId !== guestMatchId) {
+      guestMotion.reset();
+      guestMatchId = matchId;
+    }
+    guestMotion.setRunning(Boolean(matchId && session.status === 'active' && session.speed > 0), performance.now());
+  }
+
+  function renderDivisionAt(unit, screen, time = lastMapDrawTime) {
+    const position = guestMatchId ? guestMotion.division(unit, time) : unit;
+    return screen(position.x, position.y);
+  }
+
+  function seedGuestMotion(snapshot, speed) {
+    const moving = new Map((snapshot.motionUnits || []).map(unit => [unit[0], unit]));
+    guestMotion.accept({
+      units: snapshot.divisions.map(unit => moving.get(unit.id) || [unit.id, unit.x, unit.y]),
+      strikes: snapshot.activeStrikes.map(strike => [strike.id, strike.progress, speed * 0.65])
+    }, performance.now(), false);
+  }
   const $ = s => document.querySelector(s);
   const escapeHtml = value => String(value).replace(/[&<>"']/g, char =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
@@ -171,7 +196,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       selectedDivIds.clear();
       for (const d of st.divisions) {
         if (d.side !== mySide) continue;
-        const [sx, sy] = lastScreenFn(d.x, d.y);
+        const [sx, sy] = renderDivisionAt(d, lastScreenFn);
         if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) selectedDivIds.add(d.id);
       }
       rmbDragging = false;
@@ -423,7 +448,8 @@ window.AbkhaziaGame.WarRoom = (() => {
   function drawWarOverlay(ctx, env) {
     const st = E.getState();
     if (!active || !st) return;
-    const { screen, world, view, theme } = env;
+    const { screen, world, view, theme, time } = env;
+    lastMapDrawTime = time;
     lastScreenFn = screen;
     lastWorldFn = world;
     const isDark = theme === 'dark';
@@ -706,7 +732,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     // AA Radar Domes & Selected Artillery Support Radius
     for (const d of st.divisions) {
       if (d.type === 'aa') {
-        const [x, y] = screen(d.x, d.y);
+        const [x, y] = renderDivisionAt(d, screen, time);
         ctx.beginPath();
         ctx.arc(x, y, G.UNIT_TEMPLATES.aa.radarRadius * z, 0, Math.PI * 2);
         ctx.strokeStyle = d.side === 'A' ? 'rgba(56, 189, 248, 0.24)' : 'rgba(248, 113, 113, 0.22)';
@@ -715,7 +741,7 @@ window.AbkhaziaGame.WarRoom = (() => {
         ctx.stroke();
         ctx.setLineDash([]);
       } else if (d.type === 'artillery' && selectedDivIds.has(d.id)) {
-        const [x, y] = screen(d.x, d.y);
+        const [x, y] = renderDivisionAt(d, screen, time);
         ctx.beginPath();
         ctx.arc(x, y, G.UNIT_TEMPLATES.artillery.supportRadius * z, 0, Math.PI * 2);
         ctx.fillStyle = 'rgba(245, 158, 11, 0.06)';
@@ -815,7 +841,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     for (const d of st.divisions) {
       if (!d.order || (d.order.type !== 'march' && d.order.type !== 'retreat')) continue;
       if (roleNow === 'pvp' && E.getSpeed() === 0 && mySideNow && d.side !== mySideNow) continue;
-      const [fx, fy] = screen(d.x, d.y);
+      const [fx, fy] = renderDivisionAt(d, screen, time);
       const [tx, ty] = screen(d.order.tx, d.order.ty);
       if (Math.hypot(tx - fx, ty - fy) < 10) continue;
 
@@ -888,7 +914,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       ctx.setLineDash([5, 4]);
       ctx.beginPath(); ctx.moveTo(sx, sy); ctx.quadraticCurveTo(cx, cy, tx, ty); ctx.stroke();
       ctx.setLineDash([]);
-      const p = s.progress;
+      const p = guestMatchId ? guestMotion.strike(s, time) : s.progress;
       const px = (1 - p) * (1 - p) * sx + 2 * (1 - p) * p * cx + p * p * tx;
       const py = (1 - p) * (1 - p) * sy + 2 * (1 - p) * p * cy + p * p * ty;
       ctx.beginPath(); ctx.arc(px, py, 4.5, 0, Math.PI * 2); ctx.fillStyle = '#ffffff'; ctx.fill();
@@ -899,8 +925,8 @@ window.AbkhaziaGame.WarRoom = (() => {
     // Architectural NATO Division Counters
     const cw = 40, ch = 25;
     for (const d of st.divisions) {
-      const [rx, ry] = screen(d.x, d.y);
-      const x = Math.round(rx), y = Math.round(ry);
+      const [rx, ry] = renderDivisionAt(d, screen, time);
+      const x = guestMatchId ? rx : Math.round(rx), y = guestMatchId ? ry : Math.round(ry);
       if (x < -44 || y < -44 || x > env.width + 44 || y > env.height + 44) continue;
 
       const isSel = selectedDivIds.has(d.id);
@@ -1071,6 +1097,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       ctx.setLineDash([]);
     }
     ctx.restore();
+    if (guestMatchId && guestMotion.needsFrame(time)) AtlasMap.redrawOverlay();
   }
 
   function handleLeftClick(px, py, env) {
@@ -1114,7 +1141,7 @@ window.AbkhaziaGame.WarRoom = (() => {
 
     let hitDiv = null, bestD = 26;
     for (const d of st.divisions) {
-      const [sx, sy] = env.screen(d.x, d.y);
+      const [sx, sy] = renderDivisionAt(d, env.screen);
       const dd = Math.hypot(sx - px, sy - py);
       if (dd < bestD) { bestD = dd; hitDiv = d; }
     }
@@ -1909,7 +1936,10 @@ window.AbkhaziaGame.WarRoom = (() => {
           selectedDivIds.clear();
           selectedDivIds.add(id);
           const d = st.divisions.find(x => x.id === id);
-          if (d) AtlasMap.flyTo(d.x, d.y, 1.8);
+          if (d) {
+            const position = guestMatchId ? guestMotion.division(d, lastMapDrawTime) : d;
+            AtlasMap.flyTo(position.x, position.y, 1.8);
+          }
         }
         renderDom(true);
         AtlasMap.redrawOverlay();
@@ -2589,17 +2619,26 @@ window.AbkhaziaGame.WarRoom = (() => {
     G.SupabaseNet.onCommand(cmd => {
       E.executeRemoteCommand(cmd);
     });
-    G.SupabaseNet.onSnapshot((snap, roomRow) => E.applyRemoteState(snap, {
-      ...roomRow, speed: roomRow.status === 'active' ? roomRow.speed : 0
-    }));
+    G.SupabaseNet.onSnapshot((snap, roomRow) => {
+      syncGuestMotion(G.SupabaseNet.getSession());
+      const speed = roomRow.status === 'active' ? roomRow.speed : 0;
+      seedGuestMotion(snap, speed);
+      E.applyRemoteState(snap, { ...roomRow, speed });
+    });
+    G.SupabaseNet.onMotion(frame => {
+      if (!guestMatchId) return;
+      guestMotion.accept(frame, performance.now(), true);
+      AtlasMap.redrawOverlay();
+    });
     G.SupabaseNet.onRoom(sess => {
+      syncGuestMotion(sess);
       syncHeaderOnlineBadge();
       if (!sess) return;
       if (sess.status === 'active' && sess.prevStatus === 'lobby') {
         E.setOnlineMode(sess.side === 'A' ? 'host' : 'guest', sess.side);
         E.setSpeed(sess.speed);
         if (sess.side === 'A') {
-          G.SupabaseNet.startHostSyncLoop(() => E.getState());
+          G.SupabaseNet.startHostSyncLoop(E.getState, E.getMotionFrame);
         }
         if (warDialog.open) warDialog.close();
         notify('Матч начался! Сценарий: ' + sess.scenarioTitle);
@@ -2622,13 +2661,17 @@ window.AbkhaziaGame.WarRoom = (() => {
         if (restored) {
           E.setOnlineMode(restored.side === 'A' ? 'host' : 'guest', restored.side);
           if (restored.stateJson?.scenarioId === restored.scenarioId) {
+            if (restored.side === 'B') {
+              syncGuestMotion(restored);
+              seedGuestMotion(restored.stateJson, restored.speed);
+            }
             E.applyRemoteState(restored.stateJson);
           } else {
             E.initScenario(restored.scenarioId);
           }
           E.setSpeed(restored.status === 'active' ? restored.speed : 0);
           if (restored.side === 'A' && restored.status === 'active') {
-            G.SupabaseNet.startHostSyncLoop(() => E.getState());
+            G.SupabaseNet.startHostSyncLoop(E.getState, E.getMotionFrame);
           }
           G.SupabaseNet.resumeRoom();
           syncHeaderOnlineBadge();

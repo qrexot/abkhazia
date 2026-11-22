@@ -6,7 +6,7 @@ window.AbkhaziaGame = window.AbkhaziaGame || {};
 // - Works seamlessly on GitHub Pages with @supabase/supabase-js CDN
 // - Zero direct table writes: every action authenticated by 256-bit player_token
 // - Invite link support (?room=ABK-XXXX) & F5 session auto-reconnect
-// - Automatic 2.5s polling fallback if WebSockets are blocked by a firewall
+// - Realtime updates with periodic recovery for missed room and command messages
 // ============================================================================
 window.AbkhaziaGame.SupabaseNet = (() => {
   const CFG_KEY = 'abkhazia_supabase_cfg_v2';
@@ -16,18 +16,29 @@ window.AbkhaziaGame.SupabaseNet = (() => {
   let channel = null;
   let pollTimer = null;
   let pushTimer = null;
+  let pushSoon = null;
   let pushBusy = false;
+  let queuedState = null;
+  let lastPublished = null;
+  let realtimeReady = false;
+  let pollInFlight = null;
+  let lastRoomUpdate = '';
+  let roomGeneration = 0;
+  let roomEventReceivedAt = 0;
+  let lastCommandRecoveryAt = 0;
 
   let session = null; // { matchId, roomCode, side: 'A'|'B', token, scenarioId, scenarioTitle, status, hostName, guestName, speed, pausedBy }
-  let localSeq = 1;
+  let localSeq = 0;
   let lastAppliedSeq = 0;
   let processedCmdIds = new Set();
-  let pendingAckIds = [];
+  let pendingAckIds = new Set();
 
   let onStatusChange = () => {};
   let onRemoteCommand = () => {};
   let onRemoteSnapshot = () => {};
   let onRoomUpdate = () => {};
+  let onSyncError = () => {};
+  let lastReportedError = '';
 
   function getDefaultConfig() {
     const g = window.ABKHAZIA_SUPABASE_CONFIG || {};
@@ -126,81 +137,115 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     } catch (e) {}
   }
 
-  async function subscribeRoom(matchId) {
-    if (!client || !matchId) return;
-    if (channel) {
-      try { await client.removeChannel(channel); } catch (e) {}
-      channel = null;
-    }
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-
-    channel = client.channel('abk_room_' + matchId)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'online_rooms', filter: 'id=eq.' + matchId }, payload => {
-        if (payload && payload.new) handleRoomRow(payload.new);
-      })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'online_commands', filter: 'match_id=eq.' + matchId }, payload => {
-        if (payload && payload.new && session && session.side === 'A') {
-          handleIncomingCommand(payload.new);
-        }
-      })
-      .subscribe();
-
-    // Resilient fallback poller (ensures zero stalls even if WS drops on mobile/NAT)
-    pollTimer = setInterval(() => {
-      if (!client || !session || !session.matchId) return;
-      pollRoomAndCommands();
-    }, 2200);
+  function resetRoomSync() {
+    roomGeneration++;
+    stopHostSyncLoop();
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    if (client && channel) client.removeChannel(channel).catch(() => {});
+    channel = null;
+    realtimeReady = false;
+    pollInFlight = null;
+    roomEventReceivedAt = 0;
+    lastCommandRecoveryAt = 0;
+    lastRoomUpdate = '';
+    lastPublished = null;
+    lastReportedError = '';
+    queuedState = null;
+    pushBusy = false;
+    localSeq = 0;
+    lastAppliedSeq = 0;
+    processedCmdIds.clear();
+    pendingAckIds.clear();
   }
 
-  async function pollRoomAndCommands() {
-    if (!client || !session || !session.matchId) return;
-    try {
-      const { data: room } = await client.from('online_rooms').select('*').eq('id', session.matchId).single();
-      if (room) handleRoomRow(room);
-      if (session.side === 'A' && room && room.status === 'active') {
-        const { data: cmds } = await client
-          .from('online_commands')
-          .select('*')
-          .eq('match_id', session.matchId)
-          .eq('processed', false)
-          .order('id', { ascending: true })
-          .limit(30);
-        if (cmds && cmds.length) {
-          for (const c of cmds) handleIncomingCommand(c);
-        }
-      }
-    } catch (e) {}
+  function subscribeRoom(currentSession) {
+    const generation = roomGeneration;
+    const matchId = currentSession.matchId;
+    const isHost = currentSession.side === 'A';
+    const roomFields = isHost
+      ? 'id,status,host_name,guest_name,speed,paused_by,scenario_id,scenario_title,seq,updated_at'
+      : '*';
+    channel = client.channel('abk_room_' + matchId)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'online_rooms', filter: 'id=eq.' + matchId }, ({ new: row }) => {
+        if (roomGeneration !== generation || !row) return;
+        roomEventReceivedAt = Date.now();
+        handleRoomRow(row);
+      });
+    if (isHost) {
+      channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'online_commands', filter: 'match_id=eq.' + matchId }, ({ new: cmd }) => {
+        if (roomGeneration === generation) handleIncomingCommand(cmd);
+      });
+    }
+    channel.subscribe(status => {
+      if (roomGeneration !== generation) return;
+      realtimeReady = status === 'SUBSCRIBED';
+      if (realtimeReady) poll();
+    });
+
+    function poll() {
+      if (roomGeneration !== generation) return Promise.resolve();
+      if (pollInFlight) return pollInFlight;
+      clearTimeout(pollTimer);
+      pollInFlight = (async () => {
+        const now = Date.now();
+        const fetchRoom = !realtimeReady || now - roomEventReceivedAt >= 5000;
+        const fetchCommands = isHost && session.status === 'active' &&
+          (!realtimeReady || now - lastCommandRecoveryAt >= 5000);
+        const queries = [];
+        if (fetchRoom) queries.push((async () => {
+          const { data } = await client.from('online_rooms').select(roomFields).eq('id', matchId).single();
+          if (roomGeneration === generation && data) handleRoomRow(data);
+        })());
+        if (fetchCommands) queries.push((async () => {
+          const { data } = await client.from('online_commands')
+            .select('id,side,action,payload').eq('match_id', matchId).eq('processed', false)
+            .order('id', { ascending: true }).limit(30);
+          if (roomGeneration !== generation || !data) return;
+          lastCommandRecoveryAt = now;
+          for (const cmd of data) handleIncomingCommand(cmd);
+        })());
+        await Promise.allSettled(queries);
+      })().finally(() => {
+        if (roomGeneration !== generation) return;
+        pollInFlight = null;
+        if (session.status === 'finished') return;
+        pollTimer = setTimeout(poll, realtimeReady ? 2100 : 1100);
+      });
+      return pollInFlight;
+    }
+
+    return poll();
   }
 
   function handleRoomRow(row) {
     if (!session || row.id !== session.matchId) return;
+    if (row.updated_at && row.updated_at < lastRoomUpdate) return;
+    if (row.updated_at) lastRoomUpdate = row.updated_at;
+    localSeq = Math.max(localSeq, Number(row.seq) || 0);
     const prevStatus = session.status;
-    session.status = row.status;
-    session.hostName = row.host_name;
-    session.guestName = row.guest_name;
-    session.speed = row.speed;
-    session.pausedBy = row.paused_by;
-    session.scenarioId = row.scenario_id;
-    session.scenarioTitle = row.scenario_title;
-    saveSession(session);
+    const speedChanged = session.speed !== row.speed || session.pausedBy !== row.paused_by;
+    if (prevStatus !== row.status || speedChanged ||
+        session.hostName !== row.host_name || session.guestName !== row.guest_name ||
+        session.scenarioId !== row.scenario_id || session.scenarioTitle !== row.scenario_title) {
+      saveSession({
+        ...session, status: row.status, speed: row.speed, pausedBy: row.paused_by,
+        hostName: row.host_name, guestName: row.guest_name,
+        scenarioId: row.scenario_id, scenarioTitle: row.scenario_title
+      });
+      onRoomUpdate({ ...session, prevStatus, speedChanged });
+    }
 
-    if (row.seq > localSeq) localSeq = row.seq;
-    onRoomUpdate({ ...session, prevStatus });
-
-    // Guest (B) always hydrates authoritative snapshots from Host (A)
-    if (session.side === 'B' && row.state_json && Object.keys(row.state_json).length && row.seq > lastAppliedSeq) {
-      lastAppliedSeq = row.seq;
+    if (session.side === 'B' && row.state_json?.scenarioId && row.seq > lastAppliedSeq) {
+      lastAppliedSeq = Number(row.seq);
       onRemoteSnapshot(row.state_json, row);
-    } else if (session.side === 'A' && row.speed !== undefined) {
-      // Sync shared pause/speed changes initiated by Guest (B)
-      onRoomUpdate({ ...session, prevStatus, speedChanged: true });
     }
   }
 
   function handleIncomingCommand(cmd) {
-    if (!cmd || processedCmdIds.has(cmd.id)) return;
+    if (!cmd || cmd.side !== 'B' || processedCmdIds.has(cmd.id)) return;
     processedCmdIds.add(cmd.id);
-    pendingAckIds.push(cmd.id);
+    pendingAckIds.add(cmd.id);
     onRemoteCommand(cmd);
   }
 
@@ -216,10 +261,9 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     const row = Array.isArray(data) ? data[0] : data;
     if (!row || !row.match_id) throw new Error('Сервер не вернул данные комнаты');
 
+    resetRoomSync();
     localSeq = 1;
     lastAppliedSeq = 1;
-    processedCmdIds.clear();
-    pendingAckIds = [];
 
     saveSession({
       matchId: row.match_id,
@@ -234,7 +278,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
       speed: 0,
       pausedBy: null
     });
-    await subscribeRoom(row.match_id);
+    await subscribeRoom(session);
     onRoomUpdate({ ...session });
     return session;
   }
@@ -250,9 +294,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     const row = Array.isArray(data) ? data[0] : data;
     if (!row || !row.match_id) throw new Error('Комната не найдена');
 
-    lastAppliedSeq = 0;
-    processedCmdIds.clear();
-    pendingAckIds = [];
+    resetRoomSync();
 
     saveSession({
       matchId: row.match_id,
@@ -267,24 +309,24 @@ window.AbkhaziaGame.SupabaseNet = (() => {
       speed: 0,
       pausedBy: null
     });
-    await subscribeRoom(row.match_id);
-    await pollRoomAndCommands();
+    await subscribeRoom(session);
     return session;
   }
 
   async function startMatch(initialState) {
     if (!client || !session || session.side !== 'A') throw new Error('Только хост (Запад А) может начать матч');
+    const startingSession = session;
     const { error } = await client.rpc('rpc_start_match', {
-      p_match_id: session.matchId,
-      p_token: session.token,
+      p_match_id: startingSession.matchId,
+      p_token: startingSession.token,
       p_initial_state: initialState || null
     });
     if (error) throw new Error(error.message || 'Ошибка старта матча');
-    localSeq += 1;
-    session.status = 'active';
-    session.speed = 1;
-    saveSession(session);
-    onRoomUpdate({ ...session, prevStatus: 'lobby' });
+    if (session?.matchId === startingSession.matchId && session.status === 'lobby') {
+      localSeq = Math.max(localSeq, 2);
+      saveSession({ ...session, status: 'active', speed: 1 });
+      onRoomUpdate({ ...session, prevStatus: 'lobby' });
+    }
     return true;
   }
 
@@ -304,60 +346,101 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     }
   }
 
-  async function pushSnapshot(stateObj, immediate = false) {
-    if (!client || !session || session.side !== 'A' || session.status !== 'active') return;
-    if (pushBusy && !immediate) return;
-    pushBusy = true;
-    try {
-      localSeq += 1;
-      const ackBatch = pendingAckIds.splice(0, 30);
-      // Strip transient popups to keep JSON payload lean & ultra-fast!
-      const compact = { ...stateObj, popups: [] };
-      const { error } = await client.rpc('rpc_push_snapshot', {
-        p_match_id: session.matchId,
-        p_token: session.token,
-        p_seq: localSeq,
-        p_day: stateObj.day || 1,
-        p_hour: stateObj.hour || 6,
-        p_status: stateObj.status === 'finished' ? 'finished' : 'active',
-        p_winner: stateObj.winner || null,
-        p_state: compact,
-        p_processed_cmd_ids: ackBatch.length ? ackBatch : null
-      });
-      if (error && ackBatch.length) {
-        pendingAckIds.unshift(...ackBatch);
-      }
-      if (!error && stateObj.status === 'finished') {
-        session.status = 'finished';
-        saveSession(session);
-      }
-    } catch (e) {
-    } finally {
-      pushBusy = false;
+  function pushSnapshot(state, immediate = false) {
+    if (!client || session?.side !== 'A' || session.status !== 'active' || !state) return;
+    queuedState = state;
+    if (pushBusy) return;
+    if (immediate) {
+      if (!pushSoon) pushSoon = setTimeout(flushSnapshot, 65);
+    } else if (!pushSoon) {
+      flushSnapshot();
     }
   }
 
+  async function flushSnapshot() {
+    pushSoon = null;
+    if (pushBusy || !queuedState || session?.side !== 'A' || session.status !== 'active') return;
+    const generation = roomGeneration;
+    const state = queuedState;
+    queuedState = null;
+    const compact = { ...state, popups: [] };
+    const signature = JSON.stringify(compact);
+    const ackBatch = [...pendingAckIds].slice(0, 30);
+    if (!ackBatch.length && signature === lastPublished) return;
+    pushBusy = true;
+    let retry = false;
+    try {
+      const { error, data } = await client.rpc('rpc_push_snapshot', {
+        p_match_id: session.matchId,
+        p_token: session.token,
+        p_seq: ++localSeq,
+        p_day: state.day ?? 1,
+        p_hour: state.hour ?? 6,
+        p_status: state.status === 'finished' ? 'finished' : 'active',
+        p_winner: state.winner || null,
+        p_state: compact,
+        p_processed_cmd_ids: ackBatch.length ? ackBatch : null
+      });
+      if (roomGeneration !== generation) return;
+      if (error || data !== true) {
+        retry = true;
+        if (error) reportSyncError(error.message);
+        return;
+      }
+      lastReportedError = '';
+      lastPublished = signature;
+      for (const id of ackBatch) pendingAckIds.delete(id);
+      while (processedCmdIds.size > 256) {
+        const oldest = processedCmdIds.values().next().value;
+        if (pendingAckIds.has(oldest)) break;
+        processedCmdIds.delete(oldest);
+      }
+      if (compact.status === 'finished' && session.status !== 'finished') {
+        saveSession({ ...session, status: 'finished' });
+        onRoomUpdate({ ...session, prevStatus: 'active' });
+      }
+    } catch (error) {
+      if (roomGeneration === generation) {
+        retry = true;
+        reportSyncError(error.message || 'Сеть недоступна');
+      }
+    } finally {
+      if (roomGeneration === generation) {
+        pushBusy = false;
+        if (!retry && queuedState && session.status === 'active' && !pushSoon) {
+          pushSoon = setTimeout(flushSnapshot, 65);
+        }
+      }
+    }
+  }
+
+  function reportSyncError(message) {
+    if (lastReportedError === message) return;
+    lastReportedError = message;
+    onSyncError(message);
+  }
+
   function startHostSyncLoop(getStateFn) {
-    stopHostSyncLoop();
-    pushTimer = setInterval(() => {
-      if (!session || session.side !== 'A' || session.status !== 'active') return;
-      const st = getStateFn();
-      if (st) pushSnapshot(st, false);
-    }, 550);
+    if (pushTimer) return;
+    pushTimer = setInterval(() => pushSnapshot(getStateFn()), 550);
   }
 
   function stopHostSyncLoop() {
-    if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }
+    clearInterval(pushTimer);
+    clearTimeout(pushSoon);
+    pushTimer = null;
+    pushSoon = null;
   }
 
   async function setOnlineSpeed(spd) {
     if (!client || !session || session.status !== 'active') return;
     const cleanSpd = (spd === 0 || spd === 1 || spd === 2) ? spd : 1;
-    await client.rpc('rpc_set_speed', {
+    const { error } = await client.rpc('rpc_set_speed', {
       p_match_id: session.matchId,
       p_token: session.token,
       p_speed: cleanSpd
     });
+    if (error) reportSyncError(error.message);
   }
 
   async function tryRestoreSession() {
@@ -369,40 +452,38 @@ window.AbkhaziaGame.SupabaseNet = (() => {
         p_match_id: saved.matchId,
         p_token: saved.token
       });
-      if (error) { saveSession(null); return null; }
+      if (error) {
+        if (error.code === 'P0001') saveSession(null);
+        return null;
+      }
       const row = Array.isArray(data) ? data[0] : data;
       if (!row || row.status === 'finished') { saveSession(null); return null; }
+      const { data: fullRoom, error: roomError } = await client.from('online_rooms').select('*').eq('id', saved.matchId).single();
+      if (roomError || !fullRoom || fullRoom.status === 'finished') return null;
+      resetRoomSync();
       saveSession({
         ...saved,
         roomCode: row.room_code,
         scenarioId: row.scenario_id,
         scenarioTitle: row.scenario_title,
         side: row.side,
-        status: row.status,
-        hostName: row.host_name,
-        guestName: row.guest_name,
-        speed: row.speed
+        speed: fullRoom.speed,
+        pausedBy: fullRoom.paused_by,
+        status: fullRoom.status,
+        hostName: fullRoom.host_name,
+        guestName: fullRoom.guest_name
       });
-      const { data: fullRoom } = await client.from('online_rooms').select('state_json, seq').eq('id', saved.matchId).single();
-      if (fullRoom && fullRoom.seq) localSeq = Math.max(localSeq, fullRoom.seq);
-      await subscribeRoom(saved.matchId);
-      await pollRoomAndCommands();
-      return { ...session, stateJson: fullRoom ? fullRoom.state_json : null };
+      localSeq = Number(fullRoom.seq) || 0;
+      lastAppliedSeq = localSeq;
+      lastRoomUpdate = fullRoom.updated_at || '';
+      return { ...session, stateJson: fullRoom.state_json };
     } catch (e) {
       return null;
     }
   }
 
   function leaveRoom() {
-    stopHostSyncLoop();
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (client && channel) {
-      try { client.removeChannel(channel); } catch (e) {}
-    }
-    channel = null;
-    processedCmdIds.clear();
-    pendingAckIds = [];
-    lastAppliedSeq = 0;
+    resetRoomSync();
     saveSession(null);
     clearUrlRoomCode();
     onRoomUpdate(null);
@@ -437,6 +518,8 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     setOnlineSpeed,
     tryRestoreSession,
     leaveRoom,
+    resumeRoom: () => session && subscribeRoom(session),
+    onSyncError: fn => { onSyncError = fn; },
     onStatus: fn => { onStatusChange = fn; },
     onCommand: fn => { onRemoteCommand = fn; },
     onSnapshot: fn => { onRemoteSnapshot = fn; },

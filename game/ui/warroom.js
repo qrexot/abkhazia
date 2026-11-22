@@ -5,6 +5,8 @@ window.AbkhaziaGame.WarRoom = (() => {
   const G = window.AbkhaziaGame;
   const E = G.Engine;
   const $ = s => document.querySelector(s);
+  const escapeHtml = value => String(value).replace(/[&<>"']/g, char =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 
   let active = true;
   let selectedDivIds = new Set();
@@ -36,7 +38,11 @@ window.AbkhaziaGame.WarRoom = (() => {
   let lastSideRender = 0;
   let lastHudHtml = '';
   let lastSideHtml = '';
-  let lastRenderedEventId = null;
+  let renderedEventKey = null;
+  let submittedEventKey = null;
+  let countdownTimer = null;
+  let renderFrame = null;
+  const inviteCode = G.SupabaseNet?.getUrlRoomCode();
   let lastVictorySig = null;
   let uiPointerDown = false;
 
@@ -85,6 +91,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (sideWar) sideWar.hidden = false;
     if (hudEl) hudEl.hidden = false;
     if (!E.getState()) E.initScenario('gumista_split');
+    if (inviteCode) E.setSpeed(0);
     AtlasMap.setOverlay(drawWarOverlay);
     AtlasMap.setClickInterceptor(handleLeftClick);
     renderDom(true);
@@ -195,23 +202,21 @@ window.AbkhaziaGame.WarRoom = (() => {
 
   window.addEventListener('keydown', e => {
     if (!active || warDialog.open || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
-    const stK = E.getState();
-    if (stK && stK.pendingEvent && ['1', '2', '3'].includes(e.key)) {
+    const event = visibleEvent();
+    if (!e.repeat && event && ['1', '2', '3'].includes(e.key)) {
       const idx = Number(e.key) - 1;
-      if (stK.pendingEvent.event.choices[idx]) {
-        E.resolvePendingEvent(idx);
-        if (eventOverlay) eventOverlay.hidden = true;
-        lastRenderedEventId = null;
-        renderDom(true);
+      if (event.event.choices[idx]) {
+        e.preventDefault();
+        submitEventChoice(event.key, idx);
         return;
       }
     }
+    if (G.SupabaseNet?.isOnlineLobby()) return;
     if (e.code === 'Space') {
       e.preventDefault();
       const nextSpd = E.getSpeed() === 0 ? 1 : 0;
       if (G.SupabaseNet && G.SupabaseNet.isOnlineMatch()) {
         G.SupabaseNet.setOnlineSpeed(nextSpd);
-        if (G.SupabaseNet.isHost()) E.setSpeed(nextSpd);
       } else {
         E.setSpeed(nextSpd);
       }
@@ -1214,7 +1219,7 @@ window.AbkhaziaGame.WarRoom = (() => {
           <button type="button" class="${spd === 0 ? 'active' : ''}" data-spd="0" title="Пауза (Space)">II</button>
           <button type="button" class="${spd === 1 ? 'active' : ''}" data-spd="1">1×</button>
           <button type="button" class="${spd === 2 ? 'active' : ''}" data-spd="2">2×</button>
-          <button type="button" class="${spd === 4 ? 'active' : ''}" data-spd="4">4×</button>
+          ${E.getOnlineMode() ? '' : `<button type="button" class="${spd === 4 ? 'active' : ''}" data-spd="4">4×</button>`}
         </div>
         <span class="hudDay">День ${st.day} · ${hh} · <i class="todDot ${isNight ? 'night' : 'day'}"></i>${isNight ? 'Ночь' : 'День'}</span>
         ${phaseBadge}
@@ -1229,7 +1234,7 @@ window.AbkhaziaGame.WarRoom = (() => {
           const s = G.SupabaseNet.getSession();
           return `<button type="button" class="onlineMatchBadge ${s.side === 'A' ? 'sideA' : 'sideB'}" id="btnOpenOnlineFromHud" title="Открыть лобби / ссылку-приглашение">
             <i class="onlineLivePulse"></i>
-            <span>${s.roomCode} · ${s.side === 'A' ? 'ЗАПАД (А)' : 'ВОСТОК (Б)'}${s.status === 'lobby' ? ' · ЛОББИ' : ''}</span>
+            <span>${escapeHtml(s.roomCode)} · ${s.side === 'A' ? 'ЗАПАД (А)' : 'ВОСТОК (Б)'}${s.status === 'lobby' ? ' · ЛОББИ' : ''}</span>
           </button>`;
         })() : `
         <div class="roleSwitch" role="group" aria-label="Сторона управления">
@@ -1258,11 +1263,10 @@ window.AbkhaziaGame.WarRoom = (() => {
       hudEl.innerHTML = html;
       hudEl.querySelectorAll('[data-spd]').forEach(b => {
         b.onclick = () => {
+          if (G.SupabaseNet?.isOnlineLobby()) return;
           const val = Number(b.dataset.spd);
           if (G.SupabaseNet && G.SupabaseNet.isOnlineMatch()) {
-            const clamped = val === 4 ? 2 : val;
-            G.SupabaseNet.setOnlineSpeed(clamped);
-            if (G.SupabaseNet.isHost()) E.setSpeed(clamped);
+            G.SupabaseNet.setOnlineSpeed(val);
           } else {
             E.setSpeed(val);
           }
@@ -1310,12 +1314,17 @@ window.AbkhaziaGame.WarRoom = (() => {
       }
     }
 
-    if (alertEl && st.lastAlert) {
-      if (alertEl.textContent !== st.lastAlert) alertEl.textContent = st.lastAlert;
-      alertEl.hidden = false;
+    if (alertEl) {
+      const alertText = (E.getOnlineMode() && st.onlineAlerts?.[viewSide]) || st.lastAlert || '';
+      if (alertEl.textContent !== alertText) alertEl.textContent = alertText;
+      alertEl.hidden = !alertText;
     }
     if (feedBox) {
-      const items = (st.observerFeed || []).slice(0, 3);
+      const items = (st.observerFeed || []).filter(item => {
+        if (!E.getOnlineMode()) return true;
+        const audience = item.audience || item.side;
+        return audience === viewSide || !['A', 'B'].includes(audience);
+      }).slice(0, 3);
       if (items.length) {
         const feedHtml = items.map(f => `
           <div class="liveToastCard">
@@ -2150,62 +2159,86 @@ window.AbkhaziaGame.WarRoom = (() => {
     diplomacy: 'ДИПЛОМАТИЯ ПРОТИВНИКА'
   };
 
+  function visibleEvent() {
+    const net = G.SupabaseNet;
+    if ((E.getOnlineMode() || inviteCode && warDialog.open) && !net?.isOnlineMatch()) return null;
+    return E.pendingEventForPlayer();
+  }
+
+  async function submitEventChoice(key, index) {
+    if (submittedEventKey === key || visibleEvent()?.key !== key) return;
+    submittedEventKey = key;
+    renderEventModal();
+    const result = await E.answerEvent(key, index);
+    if (!result.ok && submittedEventKey === key) {
+      submittedEventKey = null;
+      notify(result.msg);
+      renderEventModal();
+    }
+  }
+
+  function updateEventCountdown() {
+    const pe = visibleEvent();
+    if (!pe || pe.key !== renderedEventKey) {
+      renderEventModal();
+      return;
+    }
+    const remMs = Math.max(0, pe.expiresAt - Date.now());
+    const remSec = Math.ceil(remMs / 1000);
+    const bar = eventOverlay.querySelector('.evTimerFill');
+    const seconds = eventOverlay.querySelector('.evTimerSec');
+    bar.style.width = Math.min(100, remMs / pe.durationMs * 100).toFixed(1) + '%';
+    bar.classList.toggle('urgent', remSec <= 3);
+    const label = remSec + ' с';
+    if (seconds.textContent !== label) seconds.textContent = label;
+    seconds.classList.toggle('urgent', remSec <= 3);
+  }
+
   function renderEventModal() {
     if (!eventOverlay) return;
-    const st = E.getState();
-    const pe = st && st.pendingEvent;
+    const pe = visibleEvent();
     if (!pe) {
       if (!eventOverlay.hidden) eventOverlay.hidden = true;
-      lastRenderedEventId = null;
+      renderedEventKey = null;
+      submittedEventKey = null;
+      clearInterval(countdownTimer);
+      countdownTimer = null;
       return;
     }
+    const waiting = submittedEventKey === pe.key;
+    if (renderedEventKey === pe.key) {
+      for (const button of eventOverlay.querySelectorAll('[data-ev-choice]')) {
+        if (button.disabled !== waiting) button.disabled = waiting;
+      }
+      return;
+    }
+    renderedEventKey = pe.key;
+
     const ev = pe.event;
-    const key = ev.id + '_' + pe.targetSide;
-    const nowMs = performance.now();
-    const remMs = Math.max(0, (pe.deadline || (nowMs + 10000)) - nowMs);
-    const dur = pe.durationMs || 10000;
-    const remSec = Math.ceil(remMs / 1000);
-    const pct = Math.max(0, Math.min(100, (remMs / dur) * 100));
-
-    if (lastRenderedEventId === key && !eventOverlay.hidden) {
-      // Smoothly update ONLY the live countdown bar & seconds badge without touching buttons!
-      const bar = eventOverlay.querySelector('.evTimerFill');
-      const secEl = eventOverlay.querySelector('.evTimerSec');
-      if (bar) {
-        bar.style.width = pct.toFixed(1) + '%';
-        bar.classList.toggle('urgent', remSec <= 3);
-      }
-      if (secEl) {
-        secEl.textContent = remSec + ' с';
-        secEl.classList.toggle('urgent', remSec <= 3);
-      }
-      return;
-    }
-    lastRenderedEventId = key;
-
     const isSecret = ev.visibility === 'secret';
-    const sideLabel = pe.targetSide === 'A' ? 'Запад (А)' : 'Восток (Б)';
+    const targetSide = E.getOnlineMode() ? playerSide() : pe.targetSide;
+    const sideLabel = targetSide === 'A' ? 'Запад (А)' : 'Восток (Б)';
     const catLabel = CAT_LABELS[ev.cat] || 'СВОДКА ШТАБА';
 
     eventOverlay.className = 'eventBannerWrap';
     eventOverlay.innerHTML = `
-      <div class="eventBanner ${isSecret ? 'isSecret' : 'isBoth'}" role="region" aria-label="${ev.title}">
-        <div class="evTimerTrack"><i class="evTimerFill ${remSec <= 3 ? 'urgent' : ''}" style="width:${pct.toFixed(1)}%"></i></div>
+      <div class="eventBanner ${isSecret ? 'isSecret' : 'isBoth'}" role="region" aria-label="${escapeHtml(ev.title)}">
+        <div class="evTimerTrack"><i class="evTimerFill"></i></div>
         <div class="evBannerTop">
           <div class="evBadges">
             <span class="eventBadge ${isSecret ? 'secret' : 'both'}">${isSecret ? 'СЕКРЕТНО · ' + sideLabel : 'СРОЧНО · ' + sideLabel}</span>
             <span class="eventCat">${catLabel}</span>
           </div>
-          <span class="evTimerSec ${remSec <= 3 ? 'urgent' : ''}" title="Осталось времени на решение">${remSec} с</span>
+          <span class="evTimerSec" title="Осталось времени на решение"></span>
         </div>
         <div class="evBannerBody">
-          <strong class="evBannerTitle">${ev.title}</strong>
-          <p class="evBannerText">${ev.text}</p>
+          <strong class="evBannerTitle">${escapeHtml(ev.title)}</strong>
+          <p class="evBannerText">${escapeHtml(ev.text)}</p>
         </div>
         <div class="evBannerChoices">
           ${ev.choices.map((ch, idx) => `
             <button type="button" class="evChoicePill" data-ev-choice="${idx}">
-              <kbd>${idx + 1}</kbd><span>${ch.label}</span>
+              <kbd>${idx + 1}</kbd><span>${escapeHtml(ch.label)}</span>
             </button>
           `).join('')}
         </div>
@@ -2213,13 +2246,10 @@ window.AbkhaziaGame.WarRoom = (() => {
     `;
     eventOverlay.hidden = false;
     eventOverlay.querySelectorAll('[data-ev-choice]').forEach(btn => {
-      btn.onclick = () => {
-        E.resolvePendingEvent(Number(btn.dataset.evChoice));
-        eventOverlay.hidden = true;
-        lastRenderedEventId = null;
-        renderDom(true);
-      };
+      btn.onclick = () => submitEventChoice(pe.key, Number(btn.dataset.evChoice));
     });
+    updateEventCountdown();
+    if (!countdownTimer) countdownTimer = setInterval(updateEventCountdown, 160);
   }
 
   function renderVictoryModal() {
@@ -2294,7 +2324,10 @@ window.AbkhaziaGame.WarRoom = (() => {
   E.subscribe(() => {
     if (!active) return;
     AtlasMap.redrawOverlay();
-    renderDom(false);
+    if (!renderFrame) renderFrame = requestAnimationFrame(() => {
+      renderFrame = null;
+      renderDom(false);
+    });
   });
 
   // ==================== ONLINE 1v1 MULTIPLAYER LOBBY (SUPABASE ANTI-CHEAT) ====================
@@ -2371,8 +2404,8 @@ window.AbkhaziaGame.WarRoom = (() => {
           </div>
           <p class="onlineSub">Выполните <code>supabase/schema.sql</code> в Supabase SQL Editor (один раз), затем впишите Project URL и Anon Public Key ниже (или один раз в <code>game/net/supabase_config.js</code> перед загрузкой на GitHub Pages, чтобы другу не пришлось ничего вводить).</p>
           <div class="onlineForm">
-            <label class="dirField"><span>Supabase Project URL</span><input id="sbUrl" type="url" placeholder="https://xxxx.supabase.co" value="${cfg.url || ''}"></label>
-            <label class="dirField"><span>Supabase Anon Public Key</span><input id="sbKey" type="text" placeholder="eyJhbGciOiJIUzI1NiIs..." value="${cfg.key || ''}"></label>
+            <label class="dirField"><span>Supabase Project URL</span><input id="sbUrl" type="url" placeholder="https://xxxx.supabase.co" value="${escapeHtml(cfg.url || '')}"></label>
+            <label class="dirField"><span>Supabase Anon Public Key</span><input id="sbKey" type="text" placeholder="eyJhbGciOiJIUzI1NiIs..." value="${escapeHtml(cfg.key || '')}"></label>
             <div class="cmdGrid">
               <button type="button" class="warBtn primary sm span2" id="btnSaveSb">Сохранить и подключиться</button>
             </div>
@@ -2389,20 +2422,20 @@ window.AbkhaziaGame.WarRoom = (() => {
         body += `
           <div class="onlineCard activeRoom">
             <div class="onlineCardHead">
-              <strong>Комната ${sess.roomCode} · ${sess.status === 'active' ? 'ИДЁТ БОЙ' : 'ЛОББИ'}</strong>
+              <strong>Комната ${escapeHtml(sess.roomCode)} · ${sess.status === 'active' ? 'ИДЁТ БОЙ' : 'ЛОББИ'}</strong>
               <span class="ownerPill ${isHost ? 'ownA' : 'ownB'}">${isHost ? 'Вы: Запад (А · Хост)' : 'Вы: Восток (Б)'}</span>
             </div>
             <div class="onlineRoomMeta">
-              <div><small>Зафиксированный сценарий (античит)</small><b>${sess.scenarioTitle}</b></div>
+              <div><small>Зафиксированный сценарий (античит)</small><b>${escapeHtml(sess.scenarioTitle)}</b></div>
               <div class="onlinePlayersRow">
-                <span class="onlineSlot ok"><b>А (Запад):</b> ${sess.hostName || 'Хост'}</span>
-                <span class="onlineSlot ${sess.guestName ? 'ok' : 'wait'}"><b>Б (Восток):</b> ${sess.guestName || 'Ожидание друга…'}</span>
+                <span class="onlineSlot ok"><b>А (Запад):</b> ${escapeHtml(sess.hostName || 'Хост')}</span>
+                <span class="onlineSlot ${sess.guestName ? 'ok' : 'wait'}"><b>Б (Восток):</b> ${escapeHtml(sess.guestName || 'Ожидание друга…')}</span>
               </div>
             </div>
             <div class="onlineInviteBox">
               <small>Ссылка-приглашение для друга (откроет сразу эту комнату):</small>
               <div class="inviteRow">
-                <input type="text" id="inviteUrlInput" readonly value="${inviteUrl}">
+                <input type="text" id="inviteUrlInput" readonly value="${escapeHtml(inviteUrl)}">
                 <button type="button" class="warBtn primary sm" id="btnCopyInvite">Копировать</button>
               </div>
             </div>
@@ -2421,7 +2454,7 @@ window.AbkhaziaGame.WarRoom = (() => {
               <div class="onlineCardHead"><strong>Создать комнату (Запад А)</strong><span class="ownerPill ownA">Хост</span></div>
               <p class="onlineSub">Выберите один сценарий — после создания он блокируется в базе (подменить нельзя), и вы получите ссылку для друга.</p>
               <div class="onlineForm">
-                <label class="dirField"><span>Ваш позывной</span><input id="onHostName" type="text" maxlength="28" placeholder="Командующий Запада" value="${onlineName}"></label>
+                <label class="dirField"><span>Ваш позывной</span><input id="onHostName" type="text" maxlength="28" placeholder="Командующий Запада" value="${escapeHtml(onlineName)}"></label>
                 <label class="dirField">
                   <span>Сценарий матча</span>
                   <select id="onScenSelect">
@@ -2436,8 +2469,8 @@ window.AbkhaziaGame.WarRoom = (() => {
               <div class="onlineCardHead"><strong>Подключиться к другу (Восток Б)</strong><span class="ownerPill ownB">Гость</span></div>
               <p class="onlineSub">Введите код комнаты от друга (например, <code>ABK-7K9P</code>) или просто перейдите по его ссылке-приглашению.</p>
               <div class="onlineForm">
-                <label class="dirField"><span>Ваш позывной</span><input id="onGuestName" type="text" maxlength="28" placeholder="Командующий Востока" value="${onlineName}"></label>
-                <label class="dirField"><span>Код комнаты</span><input id="onRoomCode" type="text" maxlength="12" placeholder="ABK-XXXX" value="${onlineJoinCode}"></label>
+                <label class="dirField"><span>Ваш позывной</span><input id="onGuestName" type="text" maxlength="28" placeholder="Командующий Востока" value="${escapeHtml(onlineName)}"></label>
+                <label class="dirField"><span>Код комнаты</span><input id="onRoomCode" type="text" maxlength="12" placeholder="ABK-XXXX" value="${escapeHtml(onlineJoinCode)}"></label>
                 <button type="button" class="warBtn danger full" id="btnJoinRoom" ${onlineBusy ? 'disabled' : ''}>Войти в комнату за Восток (Б)</button>
               </div>
             </div>
@@ -2501,16 +2534,23 @@ window.AbkhaziaGame.WarRoom = (() => {
       try { localStorage.setItem('abkhazia_player_name', name); } catch (e) {}
       onlineBusy = true; openOnlineModal();
       try {
-        const s = await net.joinRoom(code, name);
-        E.setOnlineMode('guest', 'B');
-        E.initScenario(s.scenarioId);
         E.setSpeed(0);
-        notify('Вы подключились к комнате ' + s.roomCode + ' за Восток (Б)!');
+        E.setOnlineMode('guest', 'B');
+        const session = await net.joinRoom(code, name);
+        if (E.getState()?.scenarioId !== session.scenarioId) {
+          E.initScenario(session.scenarioId);
+          E.setSpeed(session.status === 'active' ? session.speed : 0);
+        }
+        if (session.status === 'active' && warDialog.open) warDialog.close();
+        notify('Вы подключились к комнате ' + session.roomCode + ' за Восток (Б)!');
       } catch (err) {
         E.setOnlineMode(null);
         notify('Ошибка входа: ' + (err.message || err));
       } finally {
-        onlineBusy = false; syncHeaderOnlineBadge(); openOnlineModal(); renderDom(true);
+        onlineBusy = false;
+        syncHeaderOnlineBadge();
+        if (warDialog.open) openOnlineModal();
+        renderDom(true);
       }
     };
 
@@ -2520,10 +2560,6 @@ window.AbkhaziaGame.WarRoom = (() => {
       try {
         const stNow = E.getState();
         await net.startMatch({ ...stNow, popups: [] });
-        E.setSpeed(1);
-        net.startHostSyncLoop(() => E.getState());
-        warDialog.close();
-        notify('Матч начался! Синхронизация в реальном времени активна.');
       } catch (err) {
         notify('Ошибка старта: ' + (err.message || err));
       } finally {
@@ -2538,6 +2574,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (bLeave) bLeave.onclick = () => {
       net.leaveRoom();
       E.setOnlineMode(null);
+      E.initScenario(E.getState().scenarioId);
       syncHeaderOnlineBadge();
       warDialog.close();
       notify('Вы вышли из онлайн-комнаты');
@@ -2552,35 +2589,30 @@ window.AbkhaziaGame.WarRoom = (() => {
     G.SupabaseNet.onCommand(cmd => {
       E.executeRemoteCommand(cmd);
     });
-    G.SupabaseNet.onSnapshot((snap, roomRow) => {
-      E.applyRemoteState(snap, roomRow);
-      AtlasMap.redrawOverlay();
-      renderDom(false);
-    });
+    G.SupabaseNet.onSnapshot((snap, roomRow) => E.applyRemoteState(snap, {
+      ...roomRow, speed: roomRow.status === 'active' ? roomRow.speed : 0
+    }));
     G.SupabaseNet.onRoom(sess => {
       syncHeaderOnlineBadge();
       if (!sess) return;
       if (sess.status === 'active' && sess.prevStatus === 'lobby') {
         E.setOnlineMode(sess.side === 'A' ? 'host' : 'guest', sess.side);
+        E.setSpeed(sess.speed);
         if (sess.side === 'A') {
-          E.setSpeed(sess.speed || 1);
           G.SupabaseNet.startHostSyncLoop(() => E.getState());
         }
         if (warDialog.open) warDialog.close();
         notify('Матч начался! Сценарий: ' + sess.scenarioTitle);
         renderDom(true);
-      } else if (sess.status === 'active' && sess.speedChanged && sess.side === 'A') {
-        if (E.getSpeed() !== sess.speed) {
-          E.setSpeed(sess.speed);
-          if (sess.speed === 0) notify('Пауза поставлена стороной ' + (sess.pausedBy === 'B' ? 'Восток (Б)' : 'Запад (А)'));
-          else notify('Скорость игры: ' + sess.speed + '×');
-        }
+      } else if (sess.status === 'active' && sess.speedChanged) {
+        if (E.getSpeed() !== sess.speed) E.setSpeed(sess.speed);
         renderDom(true);
       } else if (warDialog.open && warDialogBody.classList.contains('onlineModal')) {
         openOnlineModal();
       }
     });
     G.SupabaseNet.onStatus(() => syncHeaderOnlineBadge());
+    G.SupabaseNet.onSyncError(message => notify('Синхронизация: ' + message));
 
     // Boot check: auto-reconnect saved session after F5, or open invite modal if ?room=ABK-XXXX!
     setTimeout(async () => {
@@ -2589,24 +2621,22 @@ window.AbkhaziaGame.WarRoom = (() => {
         const restored = await G.SupabaseNet.tryRestoreSession();
         if (restored) {
           E.setOnlineMode(restored.side === 'A' ? 'host' : 'guest', restored.side);
-          if (restored.side === 'A' && restored.status === 'active') {
+          if (restored.stateJson?.scenarioId === restored.scenarioId) {
+            E.applyRemoteState(restored.stateJson);
+          } else {
             E.initScenario(restored.scenarioId);
-            if (restored.stateJson && restored.stateJson.scenarioId === restored.scenarioId) {
-              E.applyRemoteState(restored.stateJson, restored);
-            }
-            E.setSpeed(restored.speed || 1);
-            G.SupabaseNet.startHostSyncLoop(() => E.getState());
-          } else if (restored.side === 'B') {
-            E.initScenario(restored.scenarioId);
-            E.setSpeed(restored.speed || 0);
           }
+          E.setSpeed(restored.status === 'active' ? restored.speed : 0);
+          if (restored.side === 'A' && restored.status === 'active') {
+            G.SupabaseNet.startHostSyncLoop(() => E.getState());
+          }
+          G.SupabaseNet.resumeRoom();
           syncHeaderOnlineBadge();
           notify('Восстановлено подключение к комнате ' + restored.roomCode);
           renderDom(true);
           return;
         }
       }
-      const inviteCode = G.SupabaseNet.getUrlRoomCode();
       if (inviteCode) {
         onlineJoinCode = inviteCode;
         openOnlineModal();
@@ -2620,7 +2650,7 @@ window.AbkhaziaGame.WarRoom = (() => {
   const guideBtn = $('#guideToggle');
   if (guideBtn) guideBtn.onclick = openGuideModal;
   window.addEventListener('keydown', e => {
-    if (!active || warDialog.open || E.getState()?.pendingEvent || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+    if (!active || warDialog.open || visibleEvent() || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
     if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key.toLowerCase() === 'h' || e.key.toLowerCase() === 'р')) {
       openGuideModal();
     }

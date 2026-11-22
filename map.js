@@ -7,6 +7,9 @@ const AtlasMap = (() => {
 
   // Offscreen base-map snapshot canvas (with 20% overscan for seamless 120 FPS pan/zoom!)
   const snap = document.createElement('canvas');
+  const labelCanvas = document.createElement('canvas');
+  const labelContext = labelCanvas.getContext('2d');
+  let labelView = null;
   const sctx = snap.getContext('2d', { alpha: false });
   const OVERSCAN = 1.24;
   let snapView = null;
@@ -734,7 +737,7 @@ const AtlasMap = (() => {
     const v = [x0 - 2 / z, y0 - 2 / z, x1 + 2 / z, y1 + 2 / z];
 
     if (layers.grid) drawGrid(v, P);
-    drawLabels(P);
+    drawCachedLabels(P, interacting);
     if (overlayDrawer) overlayDrawer(ctx, { screen, world, view, width, height, theme });
     if (measureMode || measurePoints.length) drawMeasure(P);
 
@@ -795,7 +798,7 @@ const AtlasMap = (() => {
     ctx.restore();
   }
 
-  function lettering(text, lon, lat, size, color, spacing, italic = false, angle = 0) {
+  function lettering(ctx, text, lon, lat, size, color, spacing, italic = false, angle = 0) {
     const [rawX, rawY] = screen(...project(lon, lat));
     const x = Math.round(rawX), y = Math.round(rawY);
     ctx.save();
@@ -809,17 +812,37 @@ const AtlasMap = (() => {
     ctx.restore();
   }
 
-  function drawLabels(P) {
+  function drawCachedLabels(palette, interacting) {
+    if (interacting || !labelContext) {
+      labelView = null;
+      drawLabels(palette, ctx);
+      return;
+    }
+    if (!labelView || labelView.view !== view || labelView.snapshot !== snapView || labelView.chosen !== chosen ||
+        labelView.width !== width || labelView.height !== height || labelView.ratio !== ratio || labelView.palette !== palette) {
+      const pixelWidth = Math.ceil(width * ratio);
+      const pixelHeight = Math.ceil(height * ratio);
+      if (labelCanvas.width !== pixelWidth) labelCanvas.width = pixelWidth;
+      if (labelCanvas.height !== pixelHeight) labelCanvas.height = pixelHeight;
+      labelContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+      labelContext.clearRect(0, 0, pixelWidth / ratio, pixelHeight / ratio);
+      drawLabels(palette, labelContext);
+      labelView = { view, snapshot: snapView, chosen, width, height, ratio, palette };
+    }
+    ctx.drawImage(labelCanvas, 0, 0, labelCanvas.width / ratio, labelCanvas.height / ratio);
+  }
+
+  function drawLabels(P, ctx) {
     labels.length = 0;
     const taken = [], used = new Map();
     const z = view.z, small = width < 600;
 
     if (z < 1.65) {
       const size = small ? 14 : 20;
-      lettering('АБХАЗИЯ', 40.98, 43.201, size, P.regionTitle, small ? 3 : 5.5);
-      lettering('РОССИЯ', 40.9, 43.59, small ? 11 : 13.5, P.neighborTitle, 3);
-      lettering('ГРУЗИЯ', 41.93, 42.46, small ? 11 : 13.5, P.neighborTitle, 2.5);
-      lettering('Чёрное море', 40.53, 42.85, small ? 19 : 29, P.seaTitle, small ? 1 : 2.2, true, 0.10);
+      lettering(ctx, 'АБХАЗИЯ', 40.98, 43.201, size, P.regionTitle, small ? 3 : 5.5);
+      lettering(ctx, 'РОССИЯ', 40.9, 43.59, small ? 11 : 13.5, P.neighborTitle, 3);
+      lettering(ctx, 'ГРУЗИЯ', 41.93, 42.46, small ? 11 : 13.5, P.neighborTitle, 2.5);
+      lettering(ctx, 'Чёрное море', 40.53, 42.85, small ? 19 : 29, P.seaTitle, small ? 1 : 2.2, true, 0.10);
     }
 
     function label(p, priority = false) {

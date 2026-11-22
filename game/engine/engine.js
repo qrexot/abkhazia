@@ -652,13 +652,19 @@ window.AbkhaziaGame.Engine = (() => {
     if (state.popups.length > 30) state.popups.shift();
   }
 
-  function setAlert(msg) {
-    if (state) state.lastAlert = msg;
+  function setAlert(msg, audience = 'both') {
+    if (!state) return;
+    if (!onlineMode || audience === 'both') state.lastAlert = msg;
+    if (onlineMode) {
+      state.onlineAlerts ||= {};
+      if (audience !== 'B') state.onlineAlerts.A = msg;
+      if (audience !== 'A') state.onlineAlerts.B = msg;
+    }
   }
 
-  function pushFeed(sideTag, text) {
+  function pushFeed(sideTag, text, audience = ['A', 'B'].includes(sideTag) ? sideTag : 'both') {
     if (!state) return;
-    state.observerFeed.unshift({ day: state.day, hour: state.hour, side: sideTag, text });
+    state.observerFeed.unshift({ day: state.day, hour: state.hour, side: sideTag, text, audience });
     if (state.observerFeed.length > 14) state.observerFeed.pop();
   }
 
@@ -962,36 +968,71 @@ window.AbkhaziaGame.Engine = (() => {
       return;
     }
 
-    // Never assign 'UN' as event targetSide in PvP mode
-    let targetSide = role === 'pvp' ? pvpSide : role;
-    if (targetSide !== 'A' && targetSide !== 'B') {
-      targetSide = Math.random() < 0.5 ? 'A' : 'B';
-    }
-    const nowMs = performance.now();
-    state.pendingEvent = { event: ev, targetSide, born: nowMs, durationMs: 10000, deadline: nowMs + 10000 };
-    emit();
+    const side = role === 'pvp' ? pvpSide : role;
+    const targetSide = onlineMode
+      ? (Math.random() < 0.5 ? 'A' : 'B')
+      : (side === 'A' || side === 'B' ? side : Math.random() < 0.5 ? 'A' : 'B');
+    openPendingEvent(ev, targetSide);
   }
 
-  function resolvePendingEvent(choiceIdx, timedOut = false) {
-    if (!state || !state.pendingEvent) return;
-    const { event, targetSide } = state.pendingEvent;
-    const choice = event.choices[choiceIdx] || event.choices[0];
-    applyEventEffect(targetSide, choice.eff);
-    if (event.visibility === 'both') {
-      const other = enemyOf(targetSide);
-      if (isAiSide(other)) {
-        const aiPick = chooseAiEventOption(other, event, choice);
-        applyEventEffect(other, aiPick.eff);
-      }
-    }
-    const shortLbl = (choice.label || '').split('(')[0].trim();
-    const note = timedOut
-      ? ('Время вышло · Штаб принял решение: «' + shortLbl + '»')
-      : (event.title + ' → «' + shortLbl + '»');
-    setAlert(note);
-    pushFeed(targetSide, note);
-    state.pendingEvent = null;
+  function openPendingEvent(event, targetSide, treaty = null) {
+    const now = Date.now();
+    const durationMs = treaty ? 30000 : onlineMode ? 18000 : 10000;
+    const sides = onlineMode && event.visibility === 'both' ? ['A', 'B'] : [targetSide];
+    state.pendingEvent = {
+      event, targetSide, treaty, durationMs, expiresAt: now + durationMs,
+      key: event.id + ':' + now,
+      answers: Object.fromEntries(sides.map(side => [side, null]))
+    };
     emit();
+    if (onlineMode === 'host') G.SupabaseNet?.pushSnapshot(state, true);
+  }
+
+  function pendingEventForPlayer() {
+    const pending = state?.pendingEvent;
+    if (!pending || state.status === 'finished') return null;
+    const side = onlineMode ? role : pending.targetSide;
+    return pending.answers?.[side] === null ? pending : null;
+  }
+
+  function resolvePendingEvent(side, key, choiceIdx, timedOut = false) {
+    const pending = state?.pendingEvent;
+    if (state?.status === 'finished' || !pending || pending.key !== key || pending.answers[side] !== null) {
+      return { ok: false, msg: 'Решение по этому событию уже принято или недоступно' };
+    }
+    const { event, treaty } = pending;
+    const choice = event.choices[choiceIdx];
+    if (!Number.isInteger(choiceIdx) || !choice) return { ok: false, msg: 'Неизвестный вариант решения' };
+    pending.answers[side] = choiceIdx;
+    if (Object.values(pending.answers).every(answer => answer !== null)) state.pendingEvent = null;
+
+    if (treaty) {
+      if (choiceIdx === 0) {
+        applyTreaty(treaty.side, treaty.type);
+      } else {
+        setAlert(timedOut ? 'Срок ответа на предложение истёк' : 'Предложение отклонено');
+      }
+    } else {
+      applyEventEffect(side, choice.eff);
+      if (!onlineMode && event.visibility === 'both') {
+        const other = enemyOf(side);
+        if (isAiSide(other)) applyEventEffect(other, chooseAiEventOption(other, event, choice).eff);
+      }
+      const shortLabel = choice.label.split('(')[0].trim();
+      const note = timedOut ? 'Время вышло · Штаб выбрал «' + shortLabel + '»' : event.title + ' → «' + shortLabel + '»';
+      setAlert(note, side);
+      pushFeed(side, note);
+    }
+    emit();
+    return { ok: true };
+  }
+
+  function answerEvent(key, choiceIdx) {
+    if (pendingEventForPlayer()?.key !== key) return { ok: false, msg: 'Это событие уже недоступно' };
+    if (onlineMode === 'guest') return G.SupabaseNet.submitCommand('resolve_event', { eventKey: key, choiceIdx });
+    const result = resolvePendingEvent(onlineMode ? role : state.pendingEvent.targetSide, key, choiceIdx);
+    if (result.ok && onlineMode === 'host') G.SupabaseNet?.pushSnapshot(state, true);
+    return result;
   }
 
   function applyEventEffect(side, eff, preferredSectorId = null) {
@@ -1036,18 +1077,20 @@ window.AbkhaziaGame.Engine = (() => {
     lastTick = performance.now();
     const tick = now => {
       loopId = requestAnimationFrame(tick);
+      if (now - lastTick < 30 && onlineMode === 'host') return;
       const dt = Math.min(0.08, (now - lastTick) / 1000);
       lastTick = now;
-      if (!state || state.status === 'finished') return;
-      if (state.pendingEvent && state.pendingEvent.deadline && now >= state.pendingEvent.deadline) {
-        const pe = state.pendingEvent;
-        const choices = pe.event.choices || [];
-        // Prefer neutral/default option on timeout, else last option
-        let defIdx = choices.findIndex(c => !c.eff || Object.keys(c.eff).length === 0);
-        if (defIdx < 0) defIdx = Math.max(0, choices.length - 1);
-        resolvePendingEvent(defIdx, true);
+      if (!state || state.status === 'finished' || onlineMode === 'guest') return;
+      const pending = state.pendingEvent;
+      if (pending && Date.now() >= pending.expiresAt) {
+        const choices = pending.event.choices;
+        const neutral = choices.findIndex(choice => !choice.eff || Object.keys(choice.eff).length === 0);
+        const fallback = pending.treaty || neutral < 0 ? choices.length - 1 : neutral;
+        for (const [side, answer] of Object.entries(pending.answers)) {
+          if (answer === null) resolvePendingEvent(side, pending.key, fallback, true);
+        }
+        if (onlineMode === 'host') G.SupabaseNet?.pushSnapshot(state, true);
       }
-      if (onlineMode === 'guest') return;
       if (speed === 0) return;
       stepRealTime(dt * speed, now);
     };
@@ -1353,14 +1396,14 @@ window.AbkhaziaGame.Engine = (() => {
           if (fObj) { state.factions.A.weapons += fObj.lootWp; state.factions.A.pp = Math.min(500, state.factions.A.pp + 10); }
           addPopup(m.x, m.y - 16, 'ЗАНЯТ: ' + m.name, '#3b82f6');
           const msgA = 'Запад занял ' + m.name + (fObj ? (' (+' + fObj.lootWp + ' ОРУЖ · ' + fObj.tag + ')') : '');
-          setAlert(msgA); pushFeed('A', msgA); recomputeSupply(); refreshTkuarchalSiege(false);
+          setAlert(msgA); pushFeed('A', msgA, 'both'); recomputeSupply(); refreshTkuarchalSiege(false);
         } else if (city.controlA <= 0.5 && prevOwner !== 'B') {
           city.controlA = 0; city.owner = 'B'; city.urbanBattle = false;
           const fObj = G.SECTOR_FACILITIES && G.SECTOR_FACILITIES[m.id];
           if (fObj) { state.factions.B.weapons += fObj.lootWp; state.factions.B.pp = Math.min(500, state.factions.B.pp + 10); }
           addPopup(m.x, m.y - 16, 'ЗАНЯТ: ' + m.name, '#ef4444');
           const msgB = 'Восток занял ' + m.name + (fObj ? (' (+' + fObj.lootWp + ' ОРУЖ · ' + fObj.tag + ')') : '');
-          setAlert(msgB); pushFeed('B', msgB); recomputeSupply(); refreshTkuarchalSiege(false);
+          setAlert(msgB); pushFeed('B', msgB, 'both'); recomputeSupply(); refreshTkuarchalSiege(false);
         }
       }
     }
@@ -1750,28 +1793,21 @@ window.AbkhaziaGame.Engine = (() => {
     if (!losing && !exhausted) return;
 
     fac.cooldowns.ai_diplo = 5;
-    const nowMs = performance.now();
-    state.pendingEvent = {
-      targetSide: role,
-      born: nowMs,
-      durationMs: 10000,
-      deadline: nowMs + 10000,
-      event: {
-        id: 'ai_diplo_' + state.day + '_' + side,
-        cat: 'diplomacy',
-        visibility: 'both',
-        title: losing ? (fac.name + ' запрашивает срочное перемирие') : (fac.name + ' предлагает заморозку фронта'),
-        text: losing
-          ? ('Командование «' + fac.name + '» несёт тяжёлые потери и предлагает остановить огонь на 3 дня для эвакуации и переговоров.')
-          : ('Обе группировки истощены затяжными боями. Штаб «' + fac.name + '» предлагает временную передышку на 3 дня.'),
-        choices: [
-          { label: 'Принять перемирие на 3 дня (+15 ПО, +12% орг. всем)', eff: { ceasefireDays: 3, pp: 15, orgAll: 12 } },
-          { label: 'Согласиться за контрибуцию (+220 ОРУЖ, +20 ПО, перемирие 3 дн.)', eff: { ceasefireDays: 3, weapons: 220, pp: 20 } },
-          { label: 'Отклонить и дожимать фронт (+8% боевой дух, +10 ПО)', eff: { morale: 8, pp: 10 } }
-        ]
-      }
-    };
-    setAlert('Дипломатическая нота от ' + fac.name);
+    openPendingEvent({
+      id: 'ai_diplo_' + state.day + '_' + side,
+      cat: 'diplomacy',
+      visibility: 'both',
+      title: losing ? (fac.name + ' запрашивает срочное перемирие') : (fac.name + ' предлагает заморозку фронта'),
+      text: losing
+        ? ('Командование «' + fac.name + '» несёт тяжёлые потери и предлагает остановить огонь на 3 дня для эвакуации и переговоров.')
+        : ('Обе группировки истощены затяжными боями. Штаб «' + fac.name + '» предлагает временную передышку на 3 дня.'),
+      choices: [
+        { label: 'Принять перемирие на 3 дня (+15 ПО, +12% орг. всем)', eff: { ceasefireDays: 3, pp: 15, orgAll: 12 } },
+        { label: 'Согласиться за контрибуцию (+220 ОРУЖ, +20 ПО, перемирие 3 дн.)', eff: { ceasefireDays: 3, weapons: 220, pp: 20 } },
+        { label: 'Отклонить и дожимать фронт (+8% боевой дух, +10 ПО)', eff: { morale: 8, pp: 10 } }
+      ]
+    }, role);
+    setAlert('Дипломатическая нота от ' + fac.name, role);
     emit();
   }
 
@@ -2353,7 +2389,7 @@ window.AbkhaziaGame.Engine = (() => {
       fac.morale = Math.min(100, fac.morale + 12);
       state.divisions.filter(d => d.side === side).forEach(d => { d.org = Math.min(100, d.org + 18); });
     }
-    setAlert(fac.name + ': ' + dec.name);
+    setAlert(fac.name + ': ' + dec.name, side);
     emit();
     return { ok: true, msg: 'Принято: ' + dec.name };
   }
@@ -2404,7 +2440,7 @@ window.AbkhaziaGame.Engine = (() => {
     applyEventEffect(side, g, sp.bonusSector);
     if (pkg.relDelta) fac.relations[sponsorId] = Math.min(100, (fac.relations[sponsorId] || 0) + pkg.relDelta);
     const bonusNote = hasBonus ? ' (+20% коридор)' : '';
-    setAlert(sp.name + ': ' + pkg.name + bonusNote);
+    setAlert(sp.name + ': ' + pkg.name + bonusNote, side);
     pushFeed(side, sp.name + ' → ' + pkg.name + bonusNote);
     emit();
     return { ok: true, msg: 'Получено: ' + pkg.name + bonusNote };
@@ -2416,6 +2452,28 @@ window.AbkhaziaGame.Engine = (() => {
     if (!tr || !fac || fac.pp < tr.costPP) return { ok: false, msg: 'Нужно ' + (tr?.costPP || 20) + ' ПО' };
     if (treatyType === 'peace_treaty' && state.day < 12) {
       return { ok: false, msg: 'Мир доступен после 12-го дня войны (сейчас день ' + state.day + ')' };
+    }
+    if (onlineMode) {
+      if (state.status === 'finished') return { ok: false, msg: 'Матч завершён' };
+      if (state.pendingEvent) return { ok: false, msg: 'Дождитесь ответа на текущее событие' };
+      openPendingEvent({
+        id: 'treaty_' + treatyType, cat: 'diplomacy', visibility: 'treaty',
+        title: tr.name,
+        text: fac.name + ' предлагает заключить соглашение.',
+        choices: [{ label: 'Принять' }, { label: 'Отклонить' }]
+      }, enemyOf(side), { side, type: treatyType });
+      setAlert('Предложение отправлено: ' + tr.name, side);
+      return { ok: true, msg: 'Предложение отправлено второй стороне' };
+    }
+    return applyTreaty(side, treatyType);
+  }
+
+  function applyTreaty(side, treatyType) {
+    const fac = state.factions[side];
+    const tr = G.TREATIES[treatyType];
+    if (fac.pp < tr.costPP) {
+      setAlert('Соглашение отменено: у инициатора недостаточно политических очков');
+      return { ok: false, msg: 'Недостаточно политических очков' };
     }
     fac.pp -= tr.costPP;
     if (treatyType === 'ceasefire_3') {
@@ -2492,7 +2550,7 @@ window.AbkhaziaGame.Engine = (() => {
       });
       fac.activeDirective = { type: 'hold_line', label: 'Глухая оборона рубежей', effort: cfg.label };
       const msg = fac.name + ': приказ Ставки — Глухая оборона';
-      setAlert(msg); pushFeed(side, 'Приказ Ставки: Глухая оборона');
+      setAlert(msg, side); pushFeed(side, 'Приказ Ставки: Глухая оборона');
       emit();
       return { ok: true, msg };
     }
@@ -2532,7 +2590,7 @@ window.AbkhaziaGame.Engine = (() => {
 
     fac.activeDirective = { type: dirType, targetId: tgt.id, label: dirTitle, effort: cfg.label, sent };
     const msg = 'Приказ Ставки: ' + dirTitle + ' (' + sent + ' див. в атаку, ' + reserves.length + ' в резерве)';
-    setAlert(msg); pushFeed(side, dirTitle + ' · ' + cfg.label);
+    setAlert(msg, side); pushFeed(side, dirTitle + ' · ' + cfg.label);
     emit();
     return { ok: true, msg };
   }
@@ -2679,7 +2737,7 @@ window.AbkhaziaGame.Engine = (() => {
     state.drawnPlans[side] = { points: points.slice(), divIds: assignedIds };
     const tgtCity = nearestSectorMeta(endPt.x, endPt.y).name;
     const msg = 'Линия наступления к «' + tgtCity + '»: задействовано ' + sent + ' див.';
-    setAlert(msg); pushFeed(side, 'Линия наступления → ' + tgtCity + ' (' + sent + ' див.)');
+    setAlert(msg, side); pushFeed(side, 'Линия наступления → ' + tgtCity + ' (' + sent + ' див.)');
     emit();
     return { ok: sent > 0, msg };
   }
@@ -2876,8 +2934,17 @@ window.AbkhaziaGame.Engine = (() => {
   function applyRemoteState(snapshot, roomRow) {
     if (!snapshot || !snapshot.scenarioId) return;
     const prevPopups = (state && state.popups) ? state.popups : [];
-    state = clone(snapshot);
-    state.popups = prevPopups;
+    // Each network snapshot is handed to the engine exactly once.
+    state = { ...snapshot, popups: prevPopups };
+    const pending = state.pendingEvent;
+    if (pending && !pending.key) {
+      const now = Date.now();
+      state.pendingEvent = {
+        ...pending, key: pending.event.id + ':' + now,
+        expiresAt: now + (pending.durationMs || 10000),
+        answers: pending.event.visibility === 'both' ? { A: null, B: null } : { [pending.targetSide]: null }
+      };
+    }
     if (roomRow && typeof roomRow.speed === 'number') speed = roomRow.speed;
     emit();
   }
@@ -2927,9 +2994,11 @@ window.AbkhaziaGame.Engine = (() => {
       case 'request_aid':
         requestAid('B', p.sponsorId, p.pkgId);
         break;
-      case 'propose_treaty':
-        proposeTreaty('B', p.treatyType);
+      case 'propose_treaty': {
+        const result = proposeTreaty('B', p.treatyType);
+        if (!result.ok) setAlert(result.msg, 'B');
         break;
+      }
       case 'directive':
         issueDirective('B', p.dirType, p.targetCityId, p.effort);
         break;
@@ -2961,9 +3030,7 @@ window.AbkhaziaGame.Engine = (() => {
         runTkuarchalSiegeAction('B', p.actionId);
         break;
       case 'resolve_event':
-        if (state.pendingEvent && state.pendingEvent.targetSide === 'B') {
-          resolvePendingEvent(Number(p.choiceIdx) || 0, false);
-        }
+        resolvePendingEvent('B', p.eventKey, p.choiceIdx);
         break;
       default:
         return;
@@ -2980,6 +3047,7 @@ window.AbkhaziaGame.Engine = (() => {
 
   function proxyCmd(action, buildPayload, localFn) {
     return function(...args) {
+      if (onlineMode && !G.SupabaseNet?.isOnlineMatch()) return { ok: false, msg: 'Дождитесь начала онлайн-матча' };
       if (onlineMode === 'guest') {
         return sendGuestCmd(action, buildPayload(...args));
       }
@@ -3025,7 +3093,8 @@ window.AbkhaziaGame.Engine = (() => {
     resetPvpReady: () => { if (state && state.pvpReady) { state.pvpReady.A = false; state.pvpReady.B = false; emit(); } },
     getSpeed: () => speed,
     setSpeed: s => { speed = s; emit(); },
-    resolvePendingEvent: proxyCmd('resolve_event', (choiceIdx) => ({ choiceIdx }), resolvePendingEvent),
+    pendingEventForPlayer,
+    answerEvent,
     triggerRandomEvent,
     orderDivisionsMarch: proxyCmd('march', (divIds, tx, ty, opMode) => ({ divIds, tx, ty, opMode }), orderDivisionsMarch),
     orderDivisionsEntrench: proxyCmd('entrench', (divIds) => ({ divIds }), orderDivisionsEntrench),

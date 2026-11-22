@@ -2378,8 +2378,10 @@ window.AbkhaziaGame.WarRoom = (() => {
   // ==================== ONLINE 1v1 MULTIPLAYER LOBBY (SUPABASE ANTI-CHEAT) ====================
   let onlineShowSetup = false;
   let onlineName = '';
-  let onlineScenarioId = 'gumista_split';
-  let onlineJoinCode = '';
+  let onlineScenarioId = '';
+  let onlineIntent = inviteCode ? 'join' : 'create';
+  let onlineJoinCode = inviteCode || '';
+  let onlineError = '';
   let onlineBusy = false;
 
   try { onlineName = localStorage.getItem('abkhazia_player_name') || ''; } catch (e) {}
@@ -2405,228 +2407,265 @@ window.AbkhaziaGame.WarRoom = (() => {
     }
   }
 
-  function copyTextSafe(txt) {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(txt).then(() => notify('Ссылка-приглашение скопирована!')).catch(() => fallbackCopy(txt));
-    } else {
-      fallbackCopy(txt);
+  function normalizeInvite(value) {
+    let code = value.trim();
+    if (/[?/:]/.test(code)) {
+      try { code = new URL(code, location.href).searchParams.get('room') || ''; }
+      catch { return ''; }
+    }
+    code = code.trim().toUpperCase();
+    if (/^[A-Z0-9]{4,6}$/.test(code)) code = 'ABK-' + code;
+    return /^ABK-[A-Z0-9]{4,6}$/.test(code) ? code : '';
+  }
+
+  function selectedOnlineScenario() {
+    return G.getScenario(onlineScenarioId || E.getState()?.scenarioId || 'gumista_split');
+  }
+
+  function scenarioPreview() {
+    const scenario = selectedOnlineScenario();
+    return `<strong>${escapeHtml(scenario.title)}</strong><span>${escapeHtml(scenario.tag)} · ${escapeHtml(scenario.difficulty)}</span>`;
+  }
+
+  function renderOnlineEntry(net, connected) {
+    const join = onlineIntent === 'join';
+    const cfg = net.loadConfig();
+    const busyLabel = join ? 'Входим…' : 'Создаём…';
+    return `
+      ${connected ? `
+        <div class="onlineSwitch" role="group" aria-label="Как начать онлайн-матч">
+          <button type="button" data-online-intent="create" aria-pressed="${!join}" ${onlineBusy ? 'disabled' : ''}>Создать комнату</button>
+          <button type="button" data-online-intent="join" aria-pressed="${join}" ${onlineBusy ? 'disabled' : ''}>Войти по приглашению</button>
+        </div>
+        <p class="onlineIntro">${join
+          ? 'Вы играете за Восток (Б). Вставьте ссылку или код, который прислал друг.'
+          : 'Вы играете за Запад (А). Выберите сценарий, затем отправьте другу приглашение.'}</p>
+        <form id="onlineEntryForm" aria-busy="${Boolean(onlineBusy)}">
+          <fieldset ${onlineBusy ? 'disabled' : ''}>
+            <label class="onlineField"><span>Ваш позывной</span><input id="onPlayerName" type="text" maxlength="28" placeholder="${join ? 'Командующий Востока' : 'Командующий Запада'}" value="${escapeHtml(onlineName)}"></label>
+            ${join ? `
+              <label class="onlineField"><span>Код или ссылка-приглашение</span><input id="onRoomCode" type="text" spellcheck="false" autocomplete="off" autocapitalize="characters" placeholder="ABK-7K9P" value="${escapeHtml(onlineJoinCode)}" aria-describedby="onlineFeedback"></label>
+            ` : `
+              <label class="onlineField"><span>Сценарий</span><select id="onScenSelect" aria-describedby="onlineScenarioPreview">
+                ${G.SCENARIOS.map(sc => `<option value="${escapeHtml(sc.id)}" ${sc.id === selectedOnlineScenario().id ? 'selected' : ''}>${escapeHtml(sc.title)}</option>`).join('')}
+              </select></label>
+              <div id="onlineScenarioPreview" class="onlineScenarioPreview">${scenarioPreview()}</div>
+            `}
+          </fieldset>
+          <p id="onlineFeedback" class="onlineFeedback" role="alert" ${onlineError ? '' : 'hidden'}>${escapeHtml(onlineError)}</p>
+          <button type="submit" class="warBtn primary onlineMainAction" id="${join ? 'btnJoinRoom' : 'btnCreateRoom'}" ${onlineBusy ? 'disabled' : ''}>${onlineBusy ? busyLabel : join ? 'Войти в комнату' : 'Создать комнату'}</button>
+        </form>
+      ` : '<p class="onlineIntro">Для онлайн-матча нужно подключение к серверу.</p>'}
+      <details class="onlineSettings" ${onlineShowSetup || !connected ? 'open' : ''}>
+        <summary>Настройки подключения</summary>
+        <form id="onlineSettingsForm">
+          <label class="onlineField"><span>Адрес Supabase</span><input id="sbUrl" type="url" required value="${escapeHtml(cfg.url)}" placeholder="https://project.supabase.co"></label>
+          <label class="onlineField"><span>Публичный ключ Supabase</span><input id="sbKey" type="password" required autocomplete="off" value="${escapeHtml(cfg.key)}"></label>
+          <p id="onlineSettingsError" class="onlineFeedback" role="alert" hidden></p>
+          <button type="submit" class="warBtn" ${onlineBusy ? 'disabled' : ''}>Сохранить подключение</button>
+        </form>
+      </details>
+    `;
+  }
+
+  function renderOnlineRoom(net, session) {
+    const host = session.side === 'A';
+    const lobby = session.status === 'lobby';
+    const ready = Boolean(session.hostName && session.guestName);
+    const status = !lobby ? (session.status === 'active' ? 'Матч идёт' : 'Матч завершён')
+      : ready ? 'Оба игрока в комнате' : 'Ожидание игрока';
+    const slot = (side, name) => {
+      const own = session.side === side;
+      const west = side === 'A';
+      return `<div class="onlineSlot ${name ? '' : 'isEmpty'}">
+        <span class="onlineSideLetter ${west ? 'sideA' : 'sideB'}">${west ? 'А' : 'Б'}</span>
+        <div><small>${west ? 'Запад' : 'Восток'}${own ? ' · Вы' : ''}</small>
+        <strong>${escapeHtml(name || 'Свободное место')}</strong></div>
+      </div>`;
+    };
+    return `
+      <div class="onlineRoomTitle">
+        <div><span>Комната</span><strong>${escapeHtml(session.roomCode)}</strong></div>
+        <span class="onlineRoomStatus ${ready ? 'isReady' : ''}" role="status">${status}</span>
+      </div>
+      <div class="onlineScenarioPreview"><span>Сценарий матча</span><strong>${escapeHtml(session.scenarioTitle)}</strong></div>
+      <div class="onlinePlayersRow">${slot('A', session.hostName)}${slot('B', session.guestName)}</div>
+      ${host || lobby ? `
+        <div class="onlineInviteBox">
+          <label class="onlineField" for="inviteUrlInput"><span>Ссылка для друга</span></label>
+          <div class="inviteRow">
+            <input type="text" readonly id="inviteUrlInput" value="${escapeHtml(net.getInviteUrl())}" aria-label="Ссылка для друга">
+            <button type="button" class="warBtn" id="btnCopyInvite">${icon('copy')}<span>Копировать</span></button>
+          </div>
+          <p id="inviteFeedback" class="onlineIntro" role="status" hidden></p>
+        </div>
+      ` : ''}
+      ${lobby ? `<p class="onlineIntro">${host
+        ? (ready ? 'Можно начинать матч.' : 'Отправьте ссылку другу. Когда он войдёт, появится возможность начать матч.')
+        : 'Вы подключены. Матч начнётся, когда создатель комнаты нажмёт «Начать матч».'}</p>` : ''}
+      <p id="onlineFeedback" class="onlineFeedback" role="alert" ${onlineError ? '' : 'hidden'}>${escapeHtml(onlineError)}</p>
+      <div class="onlineRoomActions">
+        <button class="warBtn onlineLeave" id="btnLeaveOnline" type="button" ${onlineBusy ? 'disabled' : ''}>Выйти из комнаты</button>
+        ${lobby && host ? `<button class="warBtn primary" type="button" id="btnStartOnline" ${!ready || onlineBusy ? 'disabled' : ''}>${onlineBusy ? 'Запускаем…' : 'Начать матч'}</button>` : ''}
+        ${!lobby ? '<button class="warBtn primary" id="btnResumeOnline" type="button">Вернуться на карту</button>' : ''}
+      </div>
+    `;
+  }
+
+  async function withOnlineAction(action, run) {
+    if (onlineBusy) return;
+    onlineError = '';
+    onlineBusy = true;
+    openOnlineModal();
+    try {
+      await run();
+    } catch (error) {
+      const message = error.message || '';
+      onlineError = /fetch|network|timeout/i.test(message)
+        ? 'Нет ответа от сервера. Проверьте подключение и повторите попытку.'
+        : message || 'Не удалось ' + action + '. Попробуйте ещё раз.';
+    } finally {
+      onlineBusy = false;
+      syncHeaderOnlineBadge();
+      if (warDialog.open && warDialogBody.classList.contains('onlineModal')) openOnlineModal();
+      renderDom(true);
     }
   }
 
-  function fallbackCopy(txt) {
-    const ta = document.createElement('textarea');
-    ta.value = txt;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); notify('Ссылка-приглашение скопирована!'); } catch (e) { notify('Скопируйте ссылку вручную'); }
-    ta.remove();
+  async function copyOnlineInvite() {
+    const input = $('#inviteUrlInput');
+    if (!input) return;
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(input.value);
+      copied = true;
+    } catch {
+      input.select();
+      try { copied = document.execCommand('copy'); } catch {}
+    }
+    const feedback = $('#inviteFeedback');
+    if (feedback) {
+      feedback.textContent = copied ? 'Ссылка скопирована.' : 'Ссылка выделена. Скопируйте её вручную.';
+      feedback.hidden = false;
+    }
   }
 
   function openOnlineModal() {
     const net = G.SupabaseNet;
-    if (!net) { notify('Модуль онлайн-игры не найден'); return; }
-    const cfg = net.loadConfig();
+    if (!net) { notify('Онлайн-режим недоступен'); return; }
+    const session = net.getSession();
     const connected = net.isConnected();
-    const sess = net.getSession();
-    const urlCode = net.getUrlRoomCode();
-    if (urlCode && !onlineJoinCode) onlineJoinCode = urlCode;
-    if (!onlineScenarioId && E.getState()) onlineScenarioId = E.getState().scenarioId;
-
-    warDialogTitle.textContent = 'Онлайн-матч 1 на 1 (Античит · Supabase)';
+    const focusId = warDialogBody.contains(document.activeElement) ? document.activeElement.id : null;
+    warDialogTitle.textContent = 'Онлайн-матч 1×1';
     warDialogBody.className = 'scenModal onlineModal';
+    warDialogBody.innerHTML = session ? renderOnlineRoom(net, session) : renderOnlineEntry(net, connected);
+    if (!warDialog.open) warDialog.showModal();
+    else if (focusId) document.getElementById(focusId)?.focus({ preventScroll: true });
 
-    let body = '';
-
-    // Connection / One-time Supabase config panel
-    if (!connected || onlineShowSetup) {
-      body += `
-        <div class="onlineCard">
-          <div class="onlineCardHead">
-            <strong>Подключение к вашей базе Supabase (один раз)</strong>
-            <span class="vpTag">${connected ? 'Подключено' : 'Не настроено'}</span>
-          </div>
-          <p class="onlineSub">Выполните <code>supabase/schema.sql</code> в Supabase SQL Editor (один раз), затем впишите Project URL и Anon Public Key ниже (или один раз в <code>game/net/supabase_config.js</code> перед загрузкой на GitHub Pages, чтобы другу не пришлось ничего вводить).</p>
-          <div class="onlineForm">
-            <label class="dirField"><span>Supabase Project URL</span><input id="sbUrl" type="url" placeholder="https://xxxx.supabase.co" value="${escapeHtml(cfg.url || '')}"></label>
-            <label class="dirField"><span>Supabase Anon Public Key</span><input id="sbKey" type="text" placeholder="eyJhbGciOiJIUzI1NiIs..." value="${escapeHtml(cfg.key || '')}"></label>
-            <div class="cmdGrid">
-              <button type="button" class="warBtn primary sm span2" id="btnSaveSb">Сохранить и подключиться</button>
-            </div>
-          </div>
-        </div>
-      `;
-    }
-
-    if (connected) {
-      if (sess) {
-        const inviteUrl = net.getInviteUrl();
-        const isHost = sess.side === 'A';
-        const bothHere = !!(sess.hostName && sess.guestName);
-        body += `
-          <div class="onlineCard activeRoom">
-            <div class="onlineCardHead">
-              <strong>Комната ${escapeHtml(sess.roomCode)} · ${sess.status === 'active' ? 'ИДЁТ БОЙ' : 'ЛОББИ'}</strong>
-              <span class="ownerPill ${isHost ? 'ownA' : 'ownB'}">${isHost ? 'Вы: Запад (А · Хост)' : 'Вы: Восток (Б)'}</span>
-            </div>
-            <div class="onlineRoomMeta">
-              <div><small>Зафиксированный сценарий (античит)</small><b>${escapeHtml(sess.scenarioTitle)}</b></div>
-              <div class="onlinePlayersRow">
-                <span class="onlineSlot ok"><b>А (Запад):</b> ${escapeHtml(sess.hostName || 'Хост')}</span>
-                <span class="onlineSlot ${sess.guestName ? 'ok' : 'wait'}"><b>Б (Восток):</b> ${escapeHtml(sess.guestName || 'Ожидание друга…')}</span>
-              </div>
-            </div>
-            <div class="onlineInviteBox">
-              <small>Ссылка-приглашение для друга (откроет сразу эту комнату):</small>
-              <div class="inviteRow">
-                <input type="text" id="inviteUrlInput" readonly value="${escapeHtml(inviteUrl)}">
-                <button type="button" class="warBtn primary sm" id="btnCopyInvite">Копировать</button>
-              </div>
-            </div>
-            <div class="cmdGrid" style="margin-top:10px">
-              ${isHost && sess.status === 'lobby' ? `<button type="button" class="warBtn primary span2" id="btnStartOnline" ${!bothHere || onlineBusy ? 'disabled' : ''}>${bothHere ? 'Начать матч по сценарию!' : 'Ждём подключения друга (Б)…'}</button>` : ''}
-              ${!isHost && sess.status === 'lobby' ? `<div class="onlineWaitBanner span2">Вы подключены за Восток (Б). Ждём, пока хост нажмёт «Начать матч»…</div>` : ''}
-              ${sess.status === 'active' ? `<button type="button" class="warBtn primary sm" id="btnResumeOnline">Вернуться на карту</button>` : ''}
-              <button type="button" class="warBtn danger sm ${sess.status === 'lobby' ? 'span2' : ''}" id="btnLeaveOnline">Выйти из комнаты</button>
-            </div>
-          </div>
-        `;
-      } else {
-        body += `
-          <div class="onlineGrid">
-            <div class="onlineCard">
-              <div class="onlineCardHead"><strong>Создать комнату (Запад А)</strong><span class="ownerPill ownA">Хост</span></div>
-              <p class="onlineSub">Выберите один сценарий — после создания он блокируется в базе (подменить нельзя), и вы получите ссылку для друга.</p>
-              <div class="onlineForm">
-                <label class="dirField"><span>Ваш позывной</span><input id="onHostName" type="text" maxlength="28" placeholder="Командующий Запада" value="${escapeHtml(onlineName)}"></label>
-                <label class="dirField">
-                  <span>Сценарий матча</span>
-                  <select id="onScenSelect">
-                    ${G.SCENARIOS.map(sc => `<option value="${sc.id}" ${sc.id === onlineScenarioId ? 'selected' : ''}>${sc.title} (${sc.tag})</option>`).join('')}
-                  </select>
-                </label>
-                <button type="button" class="warBtn primary full" id="btnCreateRoom" ${onlineBusy ? 'disabled' : ''}>Создать комнату и получить ссылку</button>
-              </div>
-            </div>
-
-            <div class="onlineCard">
-              <div class="onlineCardHead"><strong>Подключиться к другу (Восток Б)</strong><span class="ownerPill ownB">Гость</span></div>
-              <p class="onlineSub">Введите код комнаты от друга (например, <code>ABK-7K9P</code>) или просто перейдите по его ссылке-приглашению.</p>
-              <div class="onlineForm">
-                <label class="dirField"><span>Ваш позывной</span><input id="onGuestName" type="text" maxlength="28" placeholder="Командующий Востока" value="${escapeHtml(onlineName)}"></label>
-                <label class="dirField"><span>Код комнаты</span><input id="onRoomCode" type="text" maxlength="12" placeholder="ABK-XXXX" value="${escapeHtml(onlineJoinCode)}"></label>
-                <button type="button" class="warBtn danger full" id="btnJoinRoom" ${onlineBusy ? 'disabled' : ''}>Войти в комнату за Восток (Б)</button>
-              </div>
-            </div>
-          </div>
-          <div class="onlineFooterBar">
-            <span class="onlineSub">Сервер подключён · RLS-защита и криптотокены активны</span>
-            <button type="button" class="miniLink" id="btnToggleSbSetup">${onlineShowSetup ? 'Скрыть настройки ключей' : 'Изменить ключи Supabase'}</button>
-          </div>
-        `;
-      }
-    }
-
-    warDialogBody.innerHTML = body;
-
-    const bSave = $('#btnSaveSb');
-    if (bSave) bSave.onclick = () => {
-      const u = ($('#sbUrl')?.value || '').trim();
-      const k = ($('#sbKey')?.value || '').trim();
-      if (!u || !k) { notify('Введите Project URL и Anon Public Key'); return; }
-      const ok = net.saveConfig(u, k);
-      onlineShowSetup = !ok;
-      syncHeaderOnlineBadge();
-      openOnlineModal();
-      notify(ok ? 'Supabase подключён!' : 'Не удалось подключиться (проверьте URL и интернет)');
-    };
-
-    const bTog = $('#btnToggleSbSetup');
-    if (bTog) bTog.onclick = () => { onlineShowSetup = !onlineShowSetup; openOnlineModal(); };
-
-    const bCopy = $('#btnCopyInvite');
-    if (bCopy) bCopy.onclick = () => copyTextSafe(net.getInviteUrl());
-
-    const bCreate = $('#btnCreateRoom');
-    if (bCreate) bCreate.onclick = async () => {
-      const name = ($('#onHostName')?.value || '').trim() || 'Командующий Запада';
-      const scId = $('#onScenSelect')?.value || 'gumista_split';
-      onlineName = name; onlineScenarioId = scId;
-      try { localStorage.setItem('abkhazia_player_name', name); } catch (e) {}
-      onlineBusy = true; openOnlineModal();
-      try {
-        E.setOnlineMode('host', 'A');
-        const initSt = E.initScenario(scId);
-        E.setSpeed(0);
-        const scMeta = G.getScenario(scId);
-        await net.createRoom(scId, scMeta.title, name, { ...initSt, popups: [] });
-        notify('Комната создана! Отправьте ссылку другу.');
-      } catch (err) {
-        E.setOnlineMode(null);
-        notify('Ошибка: ' + (err.message || err));
-      } finally {
-        onlineBusy = false; syncHeaderOnlineBadge(); openOnlineModal(); renderDom(true);
-      }
-    };
-
-    const bJoin = $('#btnJoinRoom');
-    if (bJoin) bJoin.onclick = async () => {
-      const name = ($('#onGuestName')?.value || '').trim() || 'Командующий Востока';
-      const code = ($('#onRoomCode')?.value || '').trim().toUpperCase();
-      if (!code) { notify('Введите код комнаты (например ABK-7K9P)'); return; }
-      onlineName = name; onlineJoinCode = code;
-      try { localStorage.setItem('abkhazia_player_name', name); } catch (e) {}
-      onlineBusy = true; openOnlineModal();
-      try {
-        E.setSpeed(0);
-        E.setOnlineMode('guest', 'B');
-        const session = await net.joinRoom(code, name);
-        if (E.getState()?.scenarioId !== session.scenarioId) {
-          E.initScenario(session.scenarioId);
-          E.setSpeed(session.status === 'active' ? session.speed : 0);
+    const form = $('#onlineEntryForm');
+    if (form) {
+      $('#onPlayerName').oninput = e => { onlineName = e.target.value; };
+      const codeInput = $('#onRoomCode');
+      if (codeInput) codeInput.oninput = e => {
+        onlineJoinCode = e.target.value;
+        onlineError = '';
+        $('#onlineFeedback').hidden = true;
+        e.target.removeAttribute('aria-invalid');
+      };
+      const select = $('#onScenSelect');
+      if (select) select.onchange = e => {
+        onlineScenarioId = e.target.value;
+        $('#onlineScenarioPreview').innerHTML = scenarioPreview();
+      };
+      form.onsubmit = e => {
+        e.preventDefault();
+        const join = onlineIntent === 'join';
+        const code = join ? normalizeInvite(onlineJoinCode) : '';
+        if (join && !code) {
+          onlineError = 'Введите код ABK-7K9P или вставьте ссылку-приглашение.';
+          const feedback = $('#onlineFeedback');
+          feedback.textContent = onlineError;
+          feedback.hidden = false;
+          codeInput.setAttribute('aria-invalid', 'true');
+          codeInput.focus();
+          return;
         }
-        if (session.status === 'active' && warDialog.open) warDialog.close();
-        notify('Вы подключились к комнате ' + session.roomCode + ' за Восток (Б)!');
-      } catch (err) {
-        E.setOnlineMode(null);
-        notify('Ошибка входа: ' + (err.message || err));
-      } finally {
-        onlineBusy = false;
-        syncHeaderOnlineBadge();
-        if (warDialog.open) openOnlineModal();
-        renderDom(true);
-      }
-    };
+        const name = onlineName.trim() || (join ? 'Командующий Востока' : 'Командующий Запада');
+        try { localStorage.setItem('abkhazia_player_name', onlineName.trim()); } catch {}
+        if (join) onlineJoinCode = code;
+        const scenario = selectedOnlineScenario();
+        withOnlineAction(join ? 'войти в комнату' : 'создать комнату', async () => {
+          const previousRole = E.getRole();
+          const previousSpeed = E.getSpeed();
+          try {
+            if (join) {
+              E.setSpeed(0);
+              E.setOnlineMode('guest', 'B');
+              const joined = await net.joinRoom(code, name);
+              if (E.getState()?.scenarioId !== joined.scenarioId) E.initScenario(joined.scenarioId);
+              E.setSpeed(joined.status === 'active' ? joined.speed : 0);
+              if (joined.status === 'active' && warDialogBody.classList.contains('onlineModal')) warDialog.close();
+            } else {
+              E.setOnlineMode('host', 'A');
+              const initial = E.initScenario(scenario.id);
+              await net.createRoom(scenario.id, scenario.title, name, { ...initial, popups: [] });
+            }
+          } catch (error) {
+            E.setOnlineMode(null);
+            E.setRole(previousRole);
+            E.setSpeed(previousSpeed);
+            throw error;
+          }
+        });
+      };
+    }
+    warDialogBody.querySelectorAll('[data-online-intent]').forEach(button => {
+      button.onclick = () => {
+        if (onlineIntent === button.dataset.onlineIntent) return;
+        onlineIntent = button.dataset.onlineIntent;
+        onlineError = '';
+        openOnlineModal();
+        warDialogBody.querySelector('[aria-pressed="true"]')?.focus();
+      };
+    });
 
-    const bStart = $('#btnStartOnline');
-    if (bStart) bStart.onclick = async () => {
-      onlineBusy = true; openOnlineModal();
-      try {
-        const stNow = E.getState();
-        await net.startMatch({ ...stNow, popups: [] });
-      } catch (err) {
-        notify('Ошибка старта: ' + (err.message || err));
-      } finally {
-        onlineBusy = false; syncHeaderOnlineBadge(); renderDom(true);
-      }
-    };
-
-    const bRes = $('#btnResumeOnline');
-    if (bRes) bRes.onclick = () => warDialog.close();
-
-    const bLeave = $('#btnLeaveOnline');
-    if (bLeave) bLeave.onclick = () => {
+    const settingsForm = $('#onlineSettingsForm');
+    if (settingsForm) {
+      settingsForm.closest('details').ontoggle = e => { onlineShowSetup = e.target.open; };
+      settingsForm.onsubmit = e => {
+        e.preventDefault();
+        if (onlineBusy) return;
+        const url = $('#sbUrl').value.trim();
+        const key = $('#sbKey').value.trim();
+        if (url && key && net.saveConfig(url, key)) {
+          onlineShowSetup = false;
+          syncHeaderOnlineBadge();
+          openOnlineModal();
+        } else {
+          const feedback = $('#onlineSettingsError');
+          feedback.textContent = 'Не удалось подключиться. Проверьте адрес и публичный ключ.';
+          feedback.hidden = false;
+        }
+      };
+    }
+    const copy = $('#btnCopyInvite');
+    if (copy) copy.onclick = copyOnlineInvite;
+    const start = $('#btnStartOnline');
+    if (start) start.onclick = () => withOnlineAction('начать матч', () => net.startMatch({ ...E.getState(), popups: [] }));
+    const resume = $('#btnResumeOnline');
+    if (resume) resume.onclick = () => warDialog.close();
+    const leave = $('#btnLeaveOnline');
+    if (leave) leave.onclick = () => {
       net.leaveRoom();
       E.setOnlineMode(null);
       E.initScenario(E.getState().scenarioId);
-      syncHeaderOnlineBadge();
+      onlineError = '';
+      onlineJoinCode = '';
+      onlineIntent = 'create';
       warDialog.close();
       notify('Вы вышли из онлайн-комнаты');
       renderDom(true);
     };
-
-    if (!warDialog.open) warDialog.showModal();
   }
 
   // Wire Supabase Realtime callbacks -> Engine & UI
@@ -2695,10 +2734,7 @@ window.AbkhaziaGame.WarRoom = (() => {
           return;
         }
       }
-      if (inviteCode) {
-        onlineJoinCode = inviteCode;
-        openOnlineModal();
-      }
+      if (inviteCode && onlineJoinCode) openOnlineModal();
     }, 350);
   }
 

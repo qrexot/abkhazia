@@ -77,19 +77,44 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     return connect(clean.url, clean.key);
   }
 
+  function readStoredSession(storage) {
+    try { return JSON.parse(globalThis[storage]?.getItem(SESSION_KEY) || 'null'); }
+    catch { return null; }
+  }
+
+  function forgetSavedSession(saved) {
+    if (!saved) return;
+    for (const storage of ['sessionStorage', 'localStorage']) {
+      const current = readStoredSession(storage);
+      if (current?.matchId === saved.matchId && current.token === saved.token) {
+        try { globalThis[storage].removeItem(SESSION_KEY); } catch {}
+      }
+    }
+  }
+
   function saveSession(sess) {
+    const previous = session;
     session = sess;
-    try {
-      if (sess) localStorage.setItem(SESSION_KEY, JSON.stringify(sess));
-      else localStorage.removeItem(SESSION_KEY);
-    } catch (e) {}
+    if (!sess) {
+      forgetSavedSession(previous);
+      return;
+    }
+    // Keep each tab's seat across refreshes, and a fallback for a fresh visit.
+    try { globalThis.sessionStorage?.setItem(SESSION_KEY, JSON.stringify(sess)); } catch {}
+    const fallback = readStoredSession('localStorage');
+    if (previous && fallback && fallback.token !== previous.token) return;
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(sess)); } catch {}
   }
 
   function loadSavedSession() {
-    try {
-      const raw = localStorage.getItem(SESSION_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) { return null; }
+    return readStoredSession('sessionStorage') || readStoredSession('localStorage');
+  }
+
+  function getSavedRoom() {
+    const saved = loadSavedSession();
+    if (!saved?.matchId || !saved?.token || !saved?.roomCode) return null;
+    if (saved.status === 'finished') return null;
+    return { roomCode: saved.roomCode, side: saved.side };
   }
 
   function isSdkAvailable() {
@@ -359,14 +384,14 @@ window.AbkhaziaGame.SupabaseNet = (() => {
   async function submitCommand(action, payload) {
     if (!client || !session || session.status !== 'active') return { ok: false, msg: 'Матч не активен' };
     try {
-      const { error } = await client.rpc('rpc_submit_command', {
+      const { error, data } = await client.rpc('rpc_submit_command', {
         p_match_id: session.matchId,
         p_token: session.token,
         p_action: action,
         p_payload: payload || {}
       });
       if (error) return { ok: false, msg: error.message };
-      return { ok: true, msg: 'Приказ отправлен штабу' };
+      return { ok: true, msg: 'Приказ отправлен штабу', commandId: data == null ? null : String(data) };
     } catch (e) {
       return { ok: false, msg: e.message || 'Ошибка сети' };
     }
@@ -570,13 +595,14 @@ window.AbkhaziaGame.SupabaseNet = (() => {
         p_token: saved.token
       });
       if (error) {
-        if (error.code === 'P0001') saveSession(null);
+        if (error.code === 'P0001') forgetSavedSession(saved);
         return null;
       }
       const row = Array.isArray(data) ? data[0] : data;
-      if (!row || row.status === 'finished') { saveSession(null); return null; }
+      if (!row || row.status === 'finished') { forgetSavedSession(saved); return null; }
       const { data: fullRoom, error: roomError } = await client.from('online_rooms').select('*').eq('id', saved.matchId).single();
-      if (roomError || !fullRoom || fullRoom.status === 'finished') return null;
+      if (roomError || !fullRoom) return null;
+      if (fullRoom.status === 'finished') { forgetSavedSession(saved); return null; }
       resetRoomSync();
       saveSession({
         ...saved,
@@ -634,6 +660,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     startHostSyncLoop,
     stopHostSyncLoop,
     setOnlineSpeed,
+    getSavedRoom,
     tryRestoreSession,
     leaveRoom,
     resumeRoom: () => session && subscribeRoom(session),

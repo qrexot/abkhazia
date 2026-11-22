@@ -2202,8 +2202,12 @@ window.AbkhaziaGame.Engine = (() => {
   function orderDivisionsMarch(divIds, tx, ty, opMode = 'standard', skipOpCost = false) {
     if (!state || state.status === 'finished') return { ok: false, msg: 'Партия завершена' };
     if (state.phase === 'crisis') return { ok: false, msg: 'Идёт фаза кризиса: войска ждут раскола.' };
+    if (!Number.isFinite(tx) || !Number.isFinite(ty)) return { ok: false, msg: 'Укажите точку на карте' };
     const near = nearestSectorMeta(tx, ty);
     let count = 0;
+    let downgraded = 0;
+    const rejected = new Set();
+    divIds = [...new Set(divIds)];
 
     for (let i = 0; i < divIds.length; i++) {
       const d = state.divisions.find(x => x.id === divIds[i]);
@@ -2212,16 +2216,12 @@ window.AbkhaziaGame.Engine = (() => {
         if (divIds.length === 1) {
           return { ok: false, msg: 'Ткуарчал в блокаде: гарнизон заперт в горах и не может идти в наступление (используйте вылазки ДРГ)' };
         }
+        rejected.add('гарнизон в блокаде');
         continue;
       }
       if (state.ceasefireDaysLeft > 0 && state.cities[near.id].owner !== d.side) {
-        return { ok: false, msg: 'Заморозка фронта (' + state.ceasefireDaysLeft + ' дн.)' };
-      }
-      const fac = state.factions[d.side];
-      let applied = opMode;
-      if (opMode === 'massive' && !skipOpCost) {
-        if (fac.weapons < 100 || fac.pp < 8) applied = 'standard';
-        else { fac.weapons -= 100; fac.pp -= 8; }
+        rejected.add('действует перемирие');
+        continue;
       }
 
       const fromSec = nearestSectorMeta(d.x, d.y);
@@ -2230,6 +2230,7 @@ window.AbkhaziaGame.Engine = (() => {
         if (divIds.length === 1) {
           return { ok: false, msg: G.UNIT_TEMPLATES[d.type].name + ' не может пройти к ' + near.name + ' (высокогорье или взорван мост — отправьте сапёров ИНЖ)' };
         }
+        rejected.add('нет доступного маршрута');
         continue;
       }
 
@@ -2253,6 +2254,21 @@ window.AbkhaziaGame.Engine = (() => {
         }
       }
 
+      if (!waypoints.length) {
+        rejected.add('нет доступного маршрута');
+        continue;
+      }
+      const fac = state.factions[d.side];
+      let applied = opMode;
+      if (opMode === 'massive' && !skipOpCost) {
+        if (fac.weapons < 100 || fac.pp < 8) {
+          applied = 'standard';
+          downgraded++;
+        } else {
+          fac.weapons -= 100;
+          fac.pp -= 8;
+        }
+      }
       d.order = {
         type: 'march',
         tx: waypoints[waypoints.length - 1].x,
@@ -2263,7 +2279,14 @@ window.AbkhaziaGame.Engine = (() => {
       count++;
     }
     emit();
-    return { ok: count > 0, msg: count ? ('Отправлено дивизий: ' + count + ' → ' + near.name) : 'Нет доступного маршрута' };
+    const total = divIds.length;
+    const reasons = rejected.size ? ' · ' + [...rejected].join(', ') : '';
+    const standard = downgraded ? ' · стандартный режим: ' + downgraded : '';
+    return {
+      ok: count > 0,
+      msg: count ? 'Марш к «' + near.name + '» · приказ получен ' + count + ' из ' + total + standard + reasons
+        : (rejected.size ? 'Марш недоступен: ' + [...rejected].join(', ') : 'Выберите дивизию')
+    };
   }
 
   function orderDivisionsEntrench(divIds) {
@@ -2994,9 +3017,13 @@ window.AbkhaziaGame.Engine = (() => {
     const ownDivIds = ids => (ids || []).filter(id => state.divisions.some(d => d.id === id && d.side === 'B'));
 
     switch (cmd.action) {
-      case 'march':
-        orderDivisionsMarch(ownDivIds(p.divIds), Number(p.tx), Number(p.ty), p.opMode === 'massive' ? 'massive' : 'standard');
+      case 'march': {
+        const result = orderDivisionsMarch(ownDivIds(p.divIds), Number(p.tx), Number(p.ty), p.opMode === 'massive' ? 'massive' : 'standard');
+        if (cmd.id != null) {
+          state.marchReceipts = [...(state.marchReceipts || []), { id: String(cmd.id), ...result }].slice(-20);
+        }
         break;
+      }
       case 'entrench':
         orderDivisionsEntrench(ownDivIds(p.divIds));
         break;
@@ -3134,6 +3161,14 @@ window.AbkhaziaGame.Engine = (() => {
     answerEvent,
     triggerRandomEvent,
     orderDivisionsMarch: proxyCmd('march', (divIds, tx, ty, opMode) => ({ divIds, tx, ty, opMode }), orderDivisionsMarch),
+    submitMarch(divIds, tx, ty, opMode) {
+      if (!divIds.length) return { ok: false, msg: 'Выберите свою дивизию' };
+      if (onlineMode && !G.SupabaseNet?.isOnlineMatch()) return { ok: false, msg: 'Дождитесь начала матча' };
+      if (onlineMode === 'guest') return G.SupabaseNet.submitCommand('march', { divIds, tx, ty, opMode });
+      const result = orderDivisionsMarch(divIds, tx, ty, opMode);
+      if (result.ok && onlineMode === 'host') G.SupabaseNet.pushSnapshot(state, true);
+      return result;
+    },
     orderDivisionsEntrench: proxyCmd('entrench', (divIds) => ({ divIds }), orderDivisionsEntrench),
     orderDivisionsRetreat: proxyCmd('retreat', (divIds) => ({ divIds }), orderDivisionsRetreat),
     reinforceDivision: proxyCmd('reinforce', (divId) => ({ divIds: [divId] }), reinforceDivision),

@@ -1552,3 +1552,76 @@ dialog:has(.onlineModal) .dialogHead h2 { font-size: 16px; }
 }
 
 #map:has(#eventOverlay:not([hidden])) #warLensBar { visibility: hidden; }
+
+/* Mode selection on the map */
+.map-entry #layout, .map-entry #layout.collapsed { grid-template-columns: minmax(0, 1fr); gap: 0; }
+.map-entry #side, .map-entry #sideScrim, .map-entry #sidebarToggle,
+.map-entry #warHud, .map-entry #warHoverTip, .map-entry #warLensBar,
+.map-entry #eventOverlay, .map-entry #victoryOverlay { display: none; }
+
+.gameEntry {
+  position: absolute;
+  z-index: 4;
+  top: 14px;
+  left: 14px;
+  display: grid;
+  gap: 14px;
+  width: min(318px, calc(100% - 28px));
+  padding: 15px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--panel-radius);
+  background: var(--surface);
+}
+.gameEntry h2 { font-size: 16px; font-weight: 700; color: var(--ink-strong); }
+.gameEntry p { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.entryActions { display: grid; gap: 7px; }
+.entryActions .warBtn {
+  min-height: 38px;
+  height: auto;
+  padding: 7px 9px;
+  gap: 7px;
+}
+.entryActions svg { width: 15px; height: 15px; }
+.entryBrowse { justify-self: start; color: var(--muted); font-size: 12px; }
+.entryBrowse:hover { text-decoration: underline; color: var(--ink-strong); }
+
+dialog:has(.gameSetup) { width: min(550px, calc(100vw - 24px)); }
+.gameSetupForm { display: grid; gap: 13px; }
+.gameSetup select {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--ink-strong);
+  background: var(--bg);
+}
+.gameSetup .onlineScenarioPreview p { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.gameSetup .warBtn { min-height: 39px; }
+
+.marchStatus {
+  position: absolute;
+  bottom: 68px;
+  left: 12px;
+  z-index: 5;
+  max-width: min(470px, calc(100% - 70px));
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-inline-start-width: 3px;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-strong);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+.marchStatus[data-state="done"] { border-inline-start-color: var(--accent); }
+.marchStatus[data-state="waiting"] { border-inline-start-color: var(--amber); }
+.marchStatus[data-state="error"] { border-inline-start-color: var(--red); }
+
+@media (max-width: 440px) {
+  .gameEntry { top: 8px; left: 8px; width: min(318px, calc(100% - 16px)); }
+  .gameSetup select { font-size: 16px; }
+  #modeToggle > span:last-child { display: none; }
+}

@@ -17,9 +17,9 @@
   } catch (e) {}
 })();
 </script>
-<link rel="stylesheet" href="style.css?v=lobby-1">
+<link rel="stylesheet" href="style.css?v=entry-1">
 </head>
-<body class="war-mode">
+<body class="war-mode map-entry">
 <header>
   <a class="identity" href="#map" id="brandHome" aria-label="Штаб Абхазии, общий вид">
     <img src="assets/mark.svg" alt="">
@@ -30,6 +30,7 @@
   </a>
 
   <div class="headerActions">
+    <button class="themeBtn" type="button" id="modeToggle" aria-label="Выбор режима" hidden><span data-icon="index"></span><span>Режимы</span></button>
     <button class="themeBtn onlineBtn" id="onlineToggle" type="button" aria-label="Онлайн-матч 1 на 1" title="Пригласить друга по ссылке (Supabase)">
       <span class="onlineDot" id="onlineDot" aria-hidden="true"></span>
       <span id="onlineLabel">Онлайн 1×1</span>
@@ -59,6 +60,8 @@
     <canvas id="canvas" aria-hidden="true"></canvas>
     <canvas id="warCanvas" aria-hidden="true"></canvas>
 
+    <section id="gameEntry" class="gameEntry" aria-labelledby="gameEntryTitle"></section>
+    <p id="marchStatus" class="marchStatus" role="status" hidden></p>
     <div id="warHud" class="warHud"></div>
     <div id="warLensBar" class="warLensBar" hidden></div>
     <div id="warHoverTip" class="warHoverTip" hidden></div>
@@ -164,9 +167,9 @@
 <!-- Защищённый онлайн-мультиплеер (Supabase Realtime + RPC) -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js"></script>
 <script src="game/net/supabase_config.js"></script>
-<script src="game/net/supabase_client.js?v=motion-1"></script>
-<script src="game/engine/engine.js?v=layout-1"></script>
+<script src="game/net/supabase_client.js?v=entry-1"></script>
+<script src="game/engine/engine.js?v=entry-1"></script>
 <script src="game/net/motion.js?v=motion-1"></script>
-<script src="game/ui/warroom.js?v=lobby-1"></script>
+<script src="game/ui/warroom.js?v=entry-1"></script>
 </body>
 </html>

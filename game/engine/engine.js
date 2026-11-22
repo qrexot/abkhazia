@@ -15,7 +15,7 @@ window.AbkhaziaGame.Engine = (() => {
   let role = 'A';       // 'A' | 'B' | 'observer' | 'pvp'
   let onlineMode = null; // null | 'host' | 'guest'
   let pvpSide = 'A';    // 'A' | 'B' | 'UN'
-  let speed = 1;        // 0 | 1 | 2 | 4
+  let speed = 0;        // 0 | 1 | 2 | 4
   let loopId = null;
   let backgroundHostTimer = null;
   let lastTick = 0;
@@ -583,10 +583,10 @@ window.AbkhaziaGame.Engine = (() => {
     }
 
     usedEventIds = new Set();
-    aiHourCounter = 0;
+    aiHourCounter = 5;
     eventHourCounter = 0;
     hourAccum = 0;
-    if (speed === 0) speed = 1;
+    speed = 0;
 
     state = {
       scenarioId: sc.id,
@@ -639,8 +639,6 @@ window.AbkhaziaGame.Engine = (() => {
       state.lastAlert = 'Ткуарчал в полной блокаде (12 400 жителей) — гарнизон заперт в горах, но совершает вылазки ДРГ!';
     }
     if (sc.startDemarcation) spawnPeacekeepersOnFront('UN');
-    if (isAiSide('A')) runSmartAI('A');
-    if (isAiSide('B')) runSmartAI('B');
 
     lastTick = performance.now();
     startLoop();
@@ -2194,7 +2192,7 @@ window.AbkhaziaGame.Engine = (() => {
   // ==================== PLAYER COMMAND API ====================
   function setRole(nextRole) {
     role = nextRole;
-    if (state) {
+    if (state && speed > 0) {
       if (isAiSide('A')) runSmartAI('A');
       if (isAiSide('B')) runSmartAI('B');
     }

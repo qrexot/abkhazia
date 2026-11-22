@@ -17,7 +17,7 @@
   } catch (e) {}
 })();
 </script>
-<link rel="stylesheet" href="style.css?v=motion-1">
+<link rel="stylesheet" href="style.css?v=layout-1">
 </head>
 <body class="war-mode">
 <header>
@@ -36,7 +36,7 @@
     </button>
     <button class="themeBtn" id="guideToggle" type="button" aria-label="Как играть и режим вдвоём" title="Инструкция и игра вдвоём · H">
       <span class="guideDot" aria-hidden="true">?</span>
-      <span>Как играть</span>
+      <span class="guideLabel">Как играть</span>
     </button>
     <button class="themeBtn" id="themeToggle" type="button" aria-label="Переключить тему оформления" title="Сменить тему · T">
       <span class="themeIcon" id="themeIcon" data-icon="sun"></span>
@@ -47,8 +47,13 @@
 
 <main id="layout">
   <aside id="side" aria-label="Панель командования">
+    <div class="sideHeading">
+      <h1>Командование</h1>
+      <button id="sideClose" class="iconButton" type="button" aria-label="Закрыть панель командования" data-icon="close"></button>
+    </div>
     <div id="warSideContent" class="sideSlot"></div>
   </aside>
+  <div id="sideScrim" aria-hidden="true" hidden></div>
 
   <section id="map" tabindex="0" aria-label="Тактическая карта Абхазии">
     <canvas id="canvas" aria-hidden="true"></canvas>
@@ -60,17 +65,22 @@
     <div id="eventOverlay" class="eventOverlay" hidden></div>
     <div id="victoryOverlay" class="eventOverlay" hidden></div>
 
-    <div class="mapHeader">
-      <button class="mapBtn iconOnly" id="sidebarToggle" data-action="side" type="button" aria-label="Свернуть или открыть панель" title="Боковая панель · B" data-icon="sidebar"></button>
+    <div class="mapTools" role="group" aria-label="Управление картой">
+      <button class="mapBtn iconOnly" id="sidebarToggle" type="button" aria-label="Панель командования" aria-controls="side" aria-expanded="true" title="Боковая панель · B" data-icon="sidebar"></button>
       <button class="mapBtn iconOnly" id="layerButton" type="button" aria-expanded="false" aria-controls="layers" aria-label="Слои карты" title="Слои и рельеф карты">
         <span data-icon="layers"></span>
       </button>
+      <button class="mapBtn iconOnly" id="home" type="button" aria-label="Показать всю Абхазию" title="Вся карта · Home" data-icon="fit"></button>
+      <div class="zoom">
+        <button class="mapBtn" id="zoomIn" type="button" aria-label="Приблизить" title="Приблизить · +" data-icon="plus"></button>
+        <div class="zoomReadout" id="zoomLevel" title="Текущее увеличение">1.0×</div>
+        <button class="mapBtn" id="zoomOut" type="button" aria-label="Отдалить" title="Отдалить · −" data-icon="minus"></button>
+      </div>
     </div>
 
     <div id="layers" class="floating" hidden>
       <div class="panelTitleRow">
         <h3>Слои карты</h3>
-        <span class="panelBadge">HD</span>
       </div>
       <div class="presetGroup" role="group" aria-label="Стиль карты">
         <button class="presetBtn active" type="button" data-preset="atlas">Рельеф</button>
@@ -78,15 +88,6 @@
         <button class="presetBtn" type="button" data-preset="scheme">Схема</button>
       </div>
       <div id="layerItems"></div>
-    </div>
-
-    <div class="mapTools">
-      <button class="mapBtn iconOnly" id="home" type="button" aria-label="Показать всю Абхазию" title="Вся карта · Home" data-icon="fit"></button>
-      <div class="zoom">
-        <button class="mapBtn" id="zoomIn" type="button" aria-label="Приблизить" title="Приблизить · +" data-icon="plus"></button>
-        <div class="zoomReadout" id="zoomLevel" title="Текущее увеличение">1.0×</div>
-        <button class="mapBtn" id="zoomOut" type="button" aria-label="Отдалить" title="Отдалить · −" data-icon="minus"></button>
-      </div>
     </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
@@ -101,7 +102,6 @@
         <span id="zoomStatus" class="statusMono"></span>
       </div>
       <span id="position" class="statusMono"></span>
-      <span class="statusMono statusBrand">Штаб Абхазии</span>
     </div>
   </section>
 </main>
@@ -122,9 +122,9 @@
 <script src="data/points.js"></script>
 <script src="data/overview.js"></script>
 <script src="data/contours.js"></script>
-<script src="icons.js"></script>
+<script src="icons.js?v=layout-1"></script>
 <script src="map.js?v=motion-1"></script>
-<script src="script.js"></script>
+<script src="script.js?v=layout-1"></script>
 
 <!-- Модули стратегической игры -->
 <script src="game/sectors/sectors.js"></script>
@@ -165,8 +165,8 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js"></script>
 <script src="game/net/supabase_config.js"></script>
 <script src="game/net/supabase_client.js?v=motion-1"></script>
-<script src="game/engine/engine.js?v=motion-1"></script>
+<script src="game/engine/engine.js?v=layout-1"></script>
 <script src="game/net/motion.js?v=motion-1"></script>
-<script src="game/ui/warroom.js?v=motion-1"></script>
+<script src="game/ui/warroom.js?v=layout-1"></script>
 </body>
 </html>

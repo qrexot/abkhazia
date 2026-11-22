@@ -3,6 +3,10 @@
   const $ = s => document.querySelector(s);
   const layout = $('#layout');
   const side = $('#side');
+  const sidebarToggle = $('#sidebarToggle');
+  const sideClose = $('#sideClose');
+  const sideScrim = $('#sideScrim');
+  const narrowLayout = window.matchMedia('(max-width: 820px)');
   const map = AtlasMap;
   const dialog = $('#dialog');
 
@@ -109,18 +113,43 @@
     syncPresetButtons();
   }
 
+  function syncSidebar() {
+    const open = narrowLayout.matches ? side.classList.contains('open') : !layout.classList.contains('collapsed');
+    sidebarToggle.setAttribute('aria-expanded', String(open));
+    side.inert = !open;
+    sideScrim.hidden = !narrowLayout.matches || !open;
+  }
+
+  function closeMobileSidebar() {
+    if (!side.classList.contains('open')) return;
+    side.classList.remove('open');
+    syncSidebar();
+    sidebarToggle.focus({ preventScroll: true });
+  }
+
   function toggleSidebar() {
-    if (window.matchMedia('(max-width: 820px)').matches) {
-      side.classList.toggle('open');
+    if (narrowLayout.matches) {
+      if (side.classList.contains('open')) {
+        closeMobileSidebar();
+        return;
+      }
+      side.classList.add('open');
+      syncSidebar();
+      sideClose.focus({ preventScroll: true });
     } else {
       layout.classList.toggle('collapsed');
+      syncSidebar();
     }
   }
 
   hydrateIcons();
   buildLayerControls();
 
-  document.querySelectorAll('[data-action="side"]').forEach(b => { b.onclick = toggleSidebar; });
+  sidebarToggle.onclick = toggleSidebar;
+  sideClose.onclick = closeMobileSidebar;
+  sideScrim.onclick = closeMobileSidebar;
+  narrowLayout.addEventListener('change', syncSidebar);
+  syncSidebar();
   $('#layerButton').onclick = () => setLayerPanel($('#layers').hidden);
   $('#themeToggle').onclick = () => applyTheme(map.getTheme() === 'dark' ? 'light' : 'dark', true);
   $('#home').onclick = () => map.home();
@@ -136,10 +165,10 @@
 
   document.addEventListener('keydown', e => {
     const inInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName);
-    if (e.key === 'Escape' && !dialog.open) {
-      side.classList.remove('open');
+    if (e.key === 'Escape' && !document.querySelector('dialog[open]')) {
+      closeMobileSidebar();
       setLayerPanel(false);
-    } else if (!dialog.open && !inInput && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    } else if (!document.querySelector('dialog[open]') && !inInput && !e.ctrlKey && !e.metaKey && !e.altKey) {
       const k = e.key.toLowerCase();
       if (k === 't' || k === 'е') applyTheme(map.getTheme() === 'dark' ? 'light' : 'dark', true);
       else if (k === 'b' || k === 'и') toggleSidebar();

@@ -61,7 +61,7 @@ window.AbkhaziaGame.WarRoom = (() => {
   // Zero-thrash DOM sync
   let lastHudRender = 0;
   let lastSideRender = 0;
-  let lastHudHtml = '';
+  const hudParts = new Map();
   let lastSideHtml = '';
   let renderedEventKey = null;
   let submittedEventKey = null;
@@ -116,7 +116,6 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (sideWar) sideWar.hidden = false;
     if (hudEl) hudEl.hidden = false;
     if (!E.getState()) E.initScenario('gumista_split');
-    if (inviteCode) E.setSpeed(0);
     AtlasMap.setOverlay(drawWarOverlay);
     AtlasMap.setClickInterceptor(handleLeftClick);
     renderDom(true);
@@ -225,8 +224,15 @@ window.AbkhaziaGame.WarRoom = (() => {
     }
   });
 
+  function setPlaybackSpeed(speed) {
+    if (G.SupabaseNet?.isOnlineLobby() || E.getState()?.status === 'finished') return;
+    if (G.SupabaseNet?.isOnlineMatch()) G.SupabaseNet.setOnlineSpeed(speed);
+    else E.setSpeed(speed);
+    renderDom(true);
+  }
+
   window.addEventListener('keydown', e => {
-    if (!active || warDialog.open || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+    if (!active || document.querySelector('dialog[open]') || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
     const event = visibleEvent();
     if (!e.repeat && event && ['1', '2', '3'].includes(e.key)) {
       const idx = Number(e.key) - 1;
@@ -236,16 +242,9 @@ window.AbkhaziaGame.WarRoom = (() => {
         return;
       }
     }
-    if (G.SupabaseNet?.isOnlineLobby()) return;
-    if (e.code === 'Space') {
+    if (e.code === 'Space' && !e.repeat && !e.target.closest?.('button, a')) {
       e.preventDefault();
-      const nextSpd = E.getSpeed() === 0 ? 1 : 0;
-      if (G.SupabaseNet && G.SupabaseNet.isOnlineMatch()) {
-        G.SupabaseNet.setOnlineSpeed(nextSpd);
-      } else {
-        E.setSpeed(nextSpd);
-      }
-      renderDom(true);
+      setPlaybackSpeed(E.getSpeed() === 0 ? 1 : 0);
     } else if (e.key === 'Escape' && (armedAction || drawLineMode)) {
       armedAction = null;
       drawLineMode = false;
@@ -1198,9 +1197,64 @@ window.AbkhaziaGame.WarRoom = (() => {
   }
 
   // ==================== TOP COMMAND HUD ====================
+  function initHud() {
+    hudEl.innerHTML = `
+      <div class="hudOverview">
+        <div class="hudPlayback" data-hud="playback"></div>
+        <div class="hudClock">
+          <strong class="hudScenario"></strong>
+          <span class="hudDay"></span>
+        </div>
+        <div class="hudSituation" data-hud="situation"></div>
+      </div>
+      <div class="hudToolbar">
+        <div class="hudResources" data-hud="resources"></div>
+        <div class="hudActions" data-hud="actions"></div>
+      </div>
+    `;
+    hudEl.querySelectorAll('[data-hud]').forEach(node => hudParts.set(node.dataset.hud, { node, html: null }));
+    new ResizeObserver(([entry]) => {
+      hudEl.parentElement.style.setProperty('--hud-height', Math.ceil(entry.borderBoxSize?.[0]?.blockSize ?? hudEl.offsetHeight) + 'px');
+    }).observe(hudEl);
+    hudEl.addEventListener('click', e => {
+      const button = e.target.closest('button');
+      if (!button || button.disabled) return;
+      const { spd, role, pvp, tlayer } = button.dataset;
+      if (spd !== undefined) {
+        setPlaybackSpeed(Number(spd));
+      } else if (role || pvp) {
+        armedAction = null;
+        selectedDivIds.clear();
+        if (role) E.setRole(role);
+        else E.setPvpSide(pvp);
+        renderDom(true);
+      } else if (tlayer) {
+        tacLayers[tlayer] = !tacLayers[tlayer];
+        renderDom(true);
+        AtlasMap.redrawOverlay();
+      } else if (button.id === 'btnOpenOnlineFromHud') {
+        openOnlineModal();
+      } else if (button.id === 'btnScenarios') {
+        openScenariosModal();
+      }
+    });
+  }
+
+  function updateHudPart(name, html) {
+    const part = hudParts.get(name);
+    if (part.html === html) return;
+    const focused = part.node.contains(document.activeElement) ? document.activeElement : null;
+    const selector = focused?.id ? '#' + focused.id : focused && Object.keys(focused.dataset)
+      .map(key => '[data-' + key + '="' + focused.dataset[key] + '"]').join('');
+    part.html = html;
+    part.node.innerHTML = html;
+    if (selector) part.node.querySelector(selector)?.focus({ preventScroll: true });
+  }
+
   function renderHud() {
     const st = E.getState();
     if (!st || !hudEl) return;
+    if (!hudParts.size) initHud();
     const role = E.getRole();
     const pvpSide = E.getPvpSide();
     const isUnView = role === 'observer' || (role === 'pvp' && pvpSide === 'UN');
@@ -1240,35 +1294,51 @@ window.AbkhaziaGame.WarRoom = (() => {
       </div>
     `;
 
-    const html = `
-      <div class="hudGroup">
-        <div class="speedGroup" role="group" aria-label="Скорость времени">
-          <button type="button" class="${spd === 0 ? 'active' : ''}" data-spd="0" title="Пауза (Space)">II</button>
-          <button type="button" class="${spd === 1 ? 'active' : ''}" data-spd="1">1×</button>
-          <button type="button" class="${spd === 2 ? 'active' : ''}" data-spd="2">2×</button>
-          ${E.getOnlineMode() ? '' : `<button type="button" class="${spd === 4 ? 'active' : ''}" data-spd="4">4×</button>`}
-        </div>
-        <span class="hudDay">День ${st.day} · ${hh} · <i class="todDot ${isNight ? 'night' : 'day'}"></i>${isNight ? 'Ночь' : 'День'}</span>
-        ${phaseBadge}
-        <div class="vpMeter" title="Контроль Абхазии (${vp.vpA} vs ${vp.vpB} ОП)">
-          <div class="vpNums"><b class="cA">${vpPctA}%</b><span>ФРОНТ</span><b class="cB">${100 - vpPctA}%</b></div>
-          <div class="vpTrack"><i style="width:${vpPctA}%"></i></div>
-        </div>
+    const online = G.SupabaseNet?.getSession();
+    const lobby = online?.status === 'lobby';
+    const locked = lobby || online?.status === 'active';
+    const clockDisabled = lobby || st.status === 'finished';
+    const toggleLabel = lobby ? 'Ожидание' : spd > 0 ? 'Пауза' : 'Запустить';
+
+    updateHudPart('playback', `
+      <button id="clockToggle" type="button" class="clockToggle ${spd ? 'isRunning' : ''}" data-spd="${spd ? 0 : 1}" title="${toggleLabel} · Пробел" ${clockDisabled ? 'disabled' : ''}>
+        ${icon(spd ? 'pause' : 'play')}<span>${toggleLabel}</span>
+      </button>
+      <div class="speedGroup" role="group" aria-label="Скорость игры">
+        ${(E.getOnlineMode() ? [1, 2] : [1, 2, 4]).map(value => `
+          <button type="button" class="${spd === value ? 'active' : ''}" data-spd="${value}" aria-pressed="${spd === value}" aria-label="Скорость ${value}×" ${clockDisabled ? 'disabled' : ''}>${value}×</button>
+        `).join('')}
       </div>
-      ${resHtml}
-      <div class="hudActions">
-        ${(G.SupabaseNet && (G.SupabaseNet.isOnlineMatch() || G.SupabaseNet.isOnlineLobby())) ? (() => {
-          const s = G.SupabaseNet.getSession();
-          return `<button type="button" class="onlineMatchBadge ${s.side === 'A' ? 'sideA' : 'sideB'}" id="btnOpenOnlineFromHud" title="Открыть лобби / ссылку-приглашение">
+    `);
+
+    const scenario = hudEl.querySelector('.hudScenario');
+    if (scenario.textContent !== st.scenarioTitle) {
+      scenario.textContent = st.scenarioTitle;
+      scenario.title = st.scenarioTitle;
+    }
+    const day = hudEl.querySelector('.hudDay');
+    const time = 'День ' + st.day + ' · ' + hh;
+    if (day.textContent !== time) day.textContent = time;
+    day.classList.toggle('night', isNight);
+    updateHudPart('situation', `
+      ${phaseBadge}
+      <div class="vpMeter" title="Контроль Абхазии (${vp.vpA} vs ${vp.vpB} ОП)">
+        <div class="vpNums"><b class="cA">${vpPctA}%</b><span>ФРОНТ</span><b class="cB">${100 - vpPctA}%</b></div>
+        <div class="vpTrack"><i style="width:${vpPctA}%"></i></div>
+      </div>
+    `);
+    updateHudPart('resources', resHtml);
+    updateHudPart('actions', `
+        ${locked ? `
+          <button type="button" class="onlineMatchBadge ${online.side === 'A' ? 'sideA' : 'sideB'}" id="btnOpenOnlineFromHud" title="Открыть лобби">
             <i class="onlineLivePulse"></i>
-            <span>${escapeHtml(s.roomCode)} · ${s.side === 'A' ? 'ЗАПАД (А)' : 'ВОСТОК (Б)'}${s.status === 'lobby' ? ' · ЛОББИ' : ''}</span>
-          </button>`;
-        })() : `
-        <div class="roleSwitch" role="group" aria-label="Сторона управления">
-          <button type="button" class="${role === 'A' ? 'active sideA' : ''}" data-role="A" title="Игра за Запад против ИИ Востока">Запад</button>
-          <button type="button" class="${role === 'B' ? 'active sideB' : ''}" data-role="B" title="Игра за Восток против ИИ Запада">Восток</button>
-          <button type="button" class="${role === 'pvp' ? 'active pvp' : ''}" data-role="pvp" title="Игра 1 на 1 с другом без ИИ">1 на 1</button>
-          <button type="button" class="${role === 'observer' ? 'active obs' : ''}" data-role="observer" title="Наблюдатель и управление миссией ООН">ООН</button>
+            <span>${escapeHtml(online.roomCode)} · ${online.side === 'A' ? 'Запад' : 'Восток'}${lobby ? ' · Лобби' : ''}</span>
+          </button>` : `
+        <div class="roleSwitch" role="group" aria-label="Режим игры">
+          <button type="button" class="${role === 'A' ? 'active sideA' : ''}" data-role="A" aria-pressed="${role === 'A'}" title="Запад против ИИ">Запад</button>
+          <button type="button" class="${role === 'B' ? 'active sideB' : ''}" data-role="B" aria-pressed="${role === 'B'}" title="Восток против ИИ">Восток</button>
+          <button type="button" class="${role === 'pvp' ? 'active pvp' : ''}" data-role="pvp" aria-pressed="${role === 'pvp'}" title="Двое за одним экраном">Локально 1×1</button>
+          <button type="button" class="${role === 'observer' ? 'active obs' : ''}" data-role="observer" aria-pressed="${role === 'observer'}" title="Наблюдатель и миссия ООН">ООН</button>
         </div>`}
         ${role === 'pvp' ? `
         <div class="pvpSwitch" role="group" aria-label="Активная сторона (Без ИИ)">
@@ -1281,65 +1351,10 @@ window.AbkhaziaGame.WarRoom = (() => {
           <button type="button" class="${tacLayers.rail ? 'active' : ''}" data-tlayer="rail" title="Железная дорога">ЖД</button>
           <button type="button" class="${tacLayers.infra ? 'active' : ''}" data-tlayer="infra" title="Аэродромы, вертолётные площадки и порты">Авиа/ВРТ</button>
         </div>
-        <button type="button" class="hudBtn" id="btnScenarios">Сценарии (${G.SCENARIOS.length})</button>
-      </div>
-    `;
-
-    if (html !== lastHudHtml) {
-      lastHudHtml = html;
-      hudEl.innerHTML = html;
-      hudEl.querySelectorAll('[data-spd]').forEach(b => {
-        b.onclick = () => {
-          if (G.SupabaseNet?.isOnlineLobby()) return;
-          const val = Number(b.dataset.spd);
-          if (G.SupabaseNet && G.SupabaseNet.isOnlineMatch()) {
-            G.SupabaseNet.setOnlineSpeed(val);
-          } else {
-            E.setSpeed(val);
-          }
-          renderDom(true);
-        };
-      });
-      const bOnHud = $('#btnOpenOnlineFromHud');
-      if (bOnHud) bOnHud.onclick = openOnlineModal;
-      hudEl.querySelectorAll('[data-role]').forEach(b => {
-        b.onclick = () => {
-          armedAction = null; selectedDivIds.clear();
-          const r = b.dataset.role;
-          E.setRole(r);
-          const msg = r === 'observer' ? 'Миссия ООН / Наблюдатель: ИИ Запад против ИИ Восток'
-            : r === 'pvp' ? 'Режим 1 на 1: поставьте паузу (Space), отдайте приказы за Запад, передайте другу за Восток и запустите бой!'
-            : ('Управление: ' + (r === 'A' ? 'Запад (А) против ИИ Востока' : 'Восток (Б) против ИИ Запада'));
-          notify(msg);
-          renderDom(true);
-        };
-      });
-      hudEl.querySelectorAll('[data-pvp]').forEach(b => {
-        b.onclick = () => {
-          armedAction = null; selectedDivIds.clear();
-          const s = b.dataset.pvp;
-          E.setPvpSide(s);
-          const lbl = s === 'A' ? 'Запад (А)' : s === 'B' ? 'Восток (Б)' : 'Миссия ООН';
-          notify('Активная сторона (Без ИИ): ' + lbl);
-          renderDom(true);
-        };
-      });
-      hudEl.querySelectorAll('[data-tlayer]').forEach(b => {
-        b.onclick = () => {
-          const k = b.dataset.tlayer;
-          tacLayers[k] = !tacLayers[k];
-          renderDom(true);
-          AtlasMap.redrawOverlay();
-        };
-      });
-      const bSc = $('#btnScenarios');
-      if (bSc) {
-        const lockedOnline = !!(G.SupabaseNet && (G.SupabaseNet.isOnlineMatch() || G.SupabaseNet.isOnlineLobby()));
-        bSc.disabled = lockedOnline;
-        bSc.title = lockedOnline ? 'Сценарий зафиксирован для онлайн-матча (античит)' : 'Выбрать сценарий';
-        bSc.onclick = openScenariosModal;
-      }
-    }
+        <button type="button" class="hudBtn" id="btnScenarios" ${locked ? 'disabled' : ''}>
+          ${icon('index')}<span>Сценарии</span>
+        </button>
+    `);
 
     if (alertEl) {
       const alertText = (E.getOnlineMode() && st.onlineAlerts?.[viewSide]) || st.lastAlert || '';
@@ -2076,7 +2091,7 @@ window.AbkhaziaGame.WarRoom = (() => {
         if (victoryOverlay) victoryOverlay.hidden = true;
         E.initScenario(btn.dataset.sc);
         warDialog.close();
-        notify('Запущен сценарий: ' + E.getState().scenarioTitle);
+        notify('Сценарий выбран. Нажмите «Запустить», когда будете готовы.');
         renderDom(true);
       };
     });

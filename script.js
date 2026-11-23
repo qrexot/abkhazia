@@ -142,6 +142,24 @@
     }
   }
 
+  map.onSelect(point => {
+    if (!document.body.classList.contains('map-entry') || !$('#gameEntry').hidden) return;
+    map.mark(point);
+    $('#dialogTitle').textContent = point.n;
+    const details = $('#dialogBody');
+    details.className = 'placeDetails';
+    const category = document.createElement('small');
+    category.textContent = point.s || '';
+    const description = document.createElement('p');
+    description.textContent = point.d || point.a || point.n;
+    const locate = document.createElement('button');
+    locate.className = 'warBtn';
+    locate.textContent = 'Приблизить место';
+    locate.onclick = () => { dialog.close(); map.locate(point); };
+    details.replaceChildren(category, description, locate);
+    dialog.showModal();
+  });
+
   hydrateIcons();
   buildLayerControls();
 

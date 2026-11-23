@@ -3005,6 +3005,7 @@ window.AbkhaziaGame.Engine = (() => {
       };
     }
     if (roomRow && typeof roomRow.speed === 'number') speed = roomRow.speed;
+    if (onlineMode === 'host') startLoop();
     emit();
   }
 
@@ -3018,6 +3019,7 @@ window.AbkhaziaGame.Engine = (() => {
 
     switch (cmd.action) {
       case 'march': {
+        if (cmd.id != null && state.marchReceipts?.some(receipt => receipt.id === String(cmd.id))) break;
         const result = orderDivisionsMarch(ownDivIds(p.divIds), Number(p.tx), Number(p.ty), p.opMode === 'massive' ? 'massive' : 'standard');
         if (cmd.id != null) {
           state.marchReceipts = [...(state.marchReceipts || []), { id: String(cmd.id), ...result }].slice(-20);

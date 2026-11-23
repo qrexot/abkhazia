@@ -17,7 +17,7 @@
   } catch (e) {}
 })();
 </script>
-<link rel="stylesheet" href="style.css?v=entry-1">
+<link rel="stylesheet" href="style.css?v=controls-2">
 </head>
 <body class="war-mode map-entry">
 <header>
@@ -61,6 +61,10 @@
     <canvas id="warCanvas" aria-hidden="true"></canvas>
 
     <section id="gameEntry" class="gameEntry" aria-labelledby="gameEntryTitle"></section>
+    <div id="mapCommand" class="mapCommand" hidden>
+      <span id="mapCommandLabel"></span>
+      <button class="warBtn primary" id="mapCommandAction" type="button"></button>
+    </div>
     <p id="marchStatus" class="marchStatus" role="status" hidden></p>
     <div id="warHud" class="warHud"></div>
     <div id="warLensBar" class="warLensBar" hidden></div>
@@ -126,8 +130,8 @@
 <script src="data/overview.js"></script>
 <script src="data/contours.js"></script>
 <script src="icons.js?v=layout-1"></script>
-<script src="map.js?v=motion-1"></script>
-<script src="script.js?v=layout-1"></script>
+<script src="map.js?v=controls-2"></script>
+<script src="script.js?v=controls-2"></script>
 
 <!-- Модули стратегической игры -->
 <script src="game/sectors/sectors.js"></script>
@@ -165,11 +169,11 @@
 <script src="game/events/index.js"></script>
 
 <!-- Защищённый онлайн-мультиплеер (Supabase Realtime + RPC) -->
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js"></script>
+
 <script src="game/net/supabase_config.js"></script>
-<script src="game/net/supabase_client.js?v=entry-1"></script>
-<script src="game/engine/engine.js?v=entry-1"></script>
+<script src="game/net/supabase_client.js?v=controls-2"></script>
+<script src="game/engine/engine.js?v=controls-2"></script>
 <script src="game/net/motion.js?v=motion-1"></script>
-<script src="game/ui/warroom.js?v=entry-1"></script>
+<script src="game/ui/warroom.js?v=controls-2"></script>
 </body>
 </html>

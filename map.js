@@ -289,10 +289,15 @@ const AtlasMap = (() => {
   reliefLight.decoding = oceanLight.decoding = reliefDark.decoding = oceanDark.decoding = 'async';
   const onAssetLoad = () => { snapDirty = true; request(); };
   reliefLight.onload = oceanLight.onload = reliefDark.onload = oceanDark.onload = onAssetLoad;
-  reliefLight.src = 'assets/relief.webp';
-  oceanLight.src = 'assets/sea.webp';
-  reliefDark.src = 'assets/relief_dark.webp';
-  oceanDark.src = 'assets/sea_dark.webp';
+  function loadThemeImages() {
+    const dark = theme === 'dark';
+    const relief = dark ? reliefDark : reliefLight;
+    if (relief.src) return;
+    const suffix = dark ? '_dark.webp' : '.webp';
+    relief.src = 'assets/relief' + suffix;
+    (dark ? oceanDark : oceanLight).src = 'assets/sea' + suffix;
+  }
+  loadThemeImages();
 
   const cities = points.filter(p => p.k === 'city');
   const featured = points.filter(p => [
@@ -1123,6 +1128,7 @@ const AtlasMap = (() => {
 
   function setTheme(nextTheme) {
     theme = nextTheme === 'dark' ? 'dark' : 'light';
+    loadThemeImages();
     invalidate();
   }
 
@@ -1199,10 +1205,11 @@ const AtlasMap = (() => {
     pointers.set(e.pointerId, pos);
     const a = [...pointers.values()], b = a[1] || a[0];
     const mx = (a[0][0] + b[0]) / 2, my = (a[0][1] + b[1]) / 2;
-    if (Math.hypot(mx - gesture.screen[0], my - gesture.screen[1]) > 3 || a.length > 1) {
+    if (Math.hypot(mx - gesture.screen[0], my - gesture.screen[1]) > (e.pointerType === 'touch' ? 8 : 3) || a.length > 1) {
       dragged = true;
       canvas.classList.add('drag');
     }
+    if (!dragged) return;
     const z = a.length > 1
       ? clamp(gesture.z * Math.hypot(a[0][0] - b[0], a[0][1] - b[1]) / gesture.distance, baseZoom, 110)
       : gesture.z;

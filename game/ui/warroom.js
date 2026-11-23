@@ -37,6 +37,10 @@ window.AbkhaziaGame.WarRoom = (() => {
   let gameEntered = false;
   let pendingMarch = null;
   let selectedDivIds = new Set();
+  let multiSelect = false;
+  let localSession = false;
+  let localSpeed = 0;
+  let setupRole, setupScenario;
   let selectedCityId = null;
   let selectedCorridorKey = null;
   let selectedOpMode = 'standard';
@@ -123,14 +127,16 @@ window.AbkhaziaGame.WarRoom = (() => {
         ${invited ? '<p>Вас пригласили в онлайн-комнату <strong>' + escapeHtml(inviteCode) + '</strong>.</p>' : ''}
       </div>
       <div class="entryActions">
-        <button type="button" class="warBtn primary" id="entrySolo">${icon('play')} Одиночная игра</button>
-        <button type="button" class="warBtn" id="entryOnline">${invited ? 'Открыть приглашение' : 'Онлайн 1×1'}</button>
+        ${localSession ? '<button class="warBtn primary" id="continueLocal">Продолжить партию</button>' : ''}
+        <button type="button" class="warBtn ${invited || localSession ? '' : 'primary'}" id="entrySolo">${icon('play')} ${localSession ? 'Новая партия' : 'Одиночная игра'}</button>
+        <button type="button" class="warBtn ${invited ? 'primary' : ''}" id="entryOnline">${invited ? 'Войти в ' + escapeHtml(inviteCode) : 'Онлайн 1×1'}</button>
         ${saved ? '<button type="button" class="warBtn" id="entryResume">Вернуться в комнату ' + escapeHtml(saved.roomCode) + ' · ' + (saved.side === 'A' ? 'Запад' : 'Восток') + '</button>' : ''}
       </div>
       <button type="button" class="entryBrowse" id="entryBrowse">Осмотреть карту</button>`;
+    if (localSession) $('#continueLocal').onclick = () => { showGame(); E.setSpeed(localSpeed); };
     $('#entrySolo').onclick = openGameSetup;
-    $('#entryOnline').onclick = openOnlineModal;
-    if (saved) $('#entryResume').onclick = restoreOnlineRoom;
+    $('#entryOnline').onclick = () => enterOnline();
+    if (saved) $('#entryResume').onclick = () => enterOnline(true);
     $('#entryBrowse').onclick = () => {
       entryEl.hidden = true;
       $('#modeToggle').hidden = false;
@@ -148,6 +154,8 @@ window.AbkhaziaGame.WarRoom = (() => {
   }
 
   function showEntry() {
+    if (gameEntered && localSession) localSpeed = E.getSpeed();
+    multiSelect = false;
     gameEntered = false;
     resetMarchStatus();
     armedAction = null;
@@ -160,7 +168,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     entryEl.hidden = false;
     renderEntry();
     AtlasMap.redrawOverlay();
-    $('#entrySolo').focus({ preventScroll: true });
+    (entryEl.querySelector('.primary') || $('#entrySolo')).focus({ preventScroll: true });
   }
 
   function openGameSetup() {
@@ -184,18 +192,22 @@ window.AbkhaziaGame.WarRoom = (() => {
         <button type="submit" class="warBtn primary">Начать игру</button>
       </form>`;
     const scenario = $('#setupScenario');
-    scenario.value = current.scenarioId;
-    $('#setupRole').value = E.getRole();
+    scenario.value = setupScenario || current?.scenarioId || scenarios[0].id;
+    $('#setupRole').value = setupRole || E.getRole();
+    $('#setupRole').onchange = e => { setupRole = e.target.value; };
     const update = () => {
       const selected = G.getScenario(scenario.value);
       $('#setupPreview').innerHTML = '<strong>' + escapeHtml(selected.title) + '</strong><span>' +
         escapeHtml(selected.tag + ' · ' + selected.difficulty) + '</span><p>' + escapeHtml(selected.desc) + '</p>';
     };
-    scenario.onchange = update;
+    scenario.onchange = () => { setupScenario = scenario.value; update(); };
     update();
     $('#gameSetupForm').onsubmit = event => {
       event.preventDefault();
       const role = $('#setupRole').value;
+      localSession = true;
+      multiSelect = false;
+      resetMarchStatus();
       selectedDivIds.clear();
       selectedCityId = selectedCorridorKey = null;
       currentTab = 'army';
@@ -210,7 +222,10 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (!warDialog.open) warDialog.showModal();
   }
 
+  let messageTimer;
   function setMarchStatus(message, state) {
+    clearTimeout(messageTimer);
+    if (state === 'done' || state === 'error') messageTimer = setTimeout(() => { marchStatusEl.hidden = true; }, 6500);
     marchStatusEl.textContent = message;
     marchStatusEl.dataset.state = state;
     marchStatusEl.hidden = !message;
@@ -228,12 +243,12 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (!result) return;
     const updateTarget = pendingMarch.updateTarget;
     resetMarchStatus();
-    setMarchStatus(result.msg, result.ok ? 'done' : 'error');
+    setMarchStatus(result.msg + (result.ok && !E.getSpeed() ? ' · Игра на паузе' : ''), result.ok ? 'done' : 'error');
     updateTarget?.(result.ok);
   }
 
   async function submitMarch(ids, x, y, selectingTarget = false) {
-    if (pendingMarch) return;
+    if (pendingMarch) { notify('Предыдущий приказ ещё ожидает подтверждения'); return; }
     const action = armedAction;
     const updateTarget = ok => {
       if (ok && selectingTarget && armedAction === action) armedAction = null;
@@ -242,18 +257,22 @@ window.AbkhaziaGame.WarRoom = (() => {
     const ticket = {};
     pendingMarch = ticket;
     if (E.getOnlineMode() === 'guest') setMarchStatus('Отправляем приказ…', 'waiting');
-    const result = await E.submitMarch(ids, x, y, selectedOpMode);
+    let result;
+    try {
+      result = await E.submitMarch(ids, x, y, selectedOpMode);
+    } catch {
+      result = { ok: false, msg: 'Не удалось отправить приказ. Проверьте соединение.' };
+    }
     if (pendingMarch !== ticket) return;
     if (!result.commandId) {
       resetMarchStatus();
-      setMarchStatus(result.msg, result.ok ? 'done' : 'error');
+      setMarchStatus(result.msg + (result.ok && !E.getSpeed() ? ' · Игра на паузе' : ''), result.ok ? 'done' : 'error');
       updateTarget(result.ok);
       return;
     }
     ticket.id = result.commandId;
     ticket.updateTarget = updateTarget;
     ticket.timer = setTimeout(() => {
-      resetMarchStatus();
       setMarchStatus('Сервер получил приказ. Подтверждение от хоста ещё не пришло.', 'waiting');
     }, 8000);
     setMarchStatus('Сервер получил приказ. Ждём подтверждения хоста…', 'waiting');
@@ -265,7 +284,6 @@ window.AbkhaziaGame.WarRoom = (() => {
     document.body.classList.add('war-mode');
     if (sideWar) sideWar.hidden = false;
     if (hudEl) hudEl.hidden = false;
-    if (!E.getState()) E.initScenario('gumista_split');
     renderEntry();
     AtlasMap.setOverlay(drawWarOverlay);
     AtlasMap.setClickInterceptor(handleLeftClick);
@@ -1262,8 +1280,9 @@ window.AbkhaziaGame.WarRoom = (() => {
         return true;
       }
       if (armedAction.type === 'strike') {
-        notify(E.launchStrike(mySide, armedAction.strikeId, wx, wy).msg);
-        armedAction = null;
+        const result = E.launchStrike(mySide, armedAction.strikeId, wx, wy);
+        notify(result.msg);
+        if (result.ok) armedAction = null;
         renderDom(true);
         return true;
       }
@@ -1272,55 +1291,60 @@ window.AbkhaziaGame.WarRoom = (() => {
         const res = E.recruitDivision(mySide, armedAction.unit, near.id);
         notify(res.msg);
         if (res.ok && res.division) { selectedDivIds.clear(); selectedDivIds.add(res.division.id); }
-        armedAction = null;
+        if (res.ok) armedAction = null;
         renderDom(true);
         return true;
       }
       if (armedAction.type === 'airlift') {
         const near = E.nearestSectorMeta(wx, wy);
         const mine = [...selectedDivIds].filter(id => st.divisions.some(d => d.id === id && d.side === mySide));
-        notify(E.airliftDivisions(mySide, mine, near.id).msg);
-        armedAction = null;
+        const result = E.airliftDivisions(mySide, mine, near.id);
+        notify(result.msg);
+        if (result.ok) armedAction = null;
         renderDom(true);
         return true;
       }
     }
 
-    let hitDiv = null, bestD = 26;
+    const hits = [];
+    const addHit = (kind, obj, point, radius) => {
+      const distance = Math.hypot(point[0] - px, point[1] - py);
+      if (distance < radius) hits.push({ kind, id: obj.id, label: obj.name, distance });
+    };
     for (const d of st.divisions) {
-      const [sx, sy] = renderDivisionAt(d, env.screen);
-      const dd = Math.hypot(sx - px, sy - py);
-      if (dd < bestD) { bestD = dd; hitDiv = d; }
+      if (d.side !== 'N') addHit('unit', d, renderDivisionAt(d, env.screen), 26);
     }
-    if (hitDiv && hitDiv.side !== 'N') {
-      if (shiftHeld && mySide && hitDiv.side === mySide) {
-        if (selectedDivIds.has(hitDiv.id)) selectedDivIds.delete(hitDiv.id);
-        else selectedDivIds.add(hitDiv.id);
-      } else {
-        selectedDivIds.clear();
-        selectedDivIds.add(hitDiv.id);
+    for (const city of G.SECTORS) addHit('city', city, env.screen(city.x, city.y), 24);
+    if (hits.length) {
+      const pick = hit => {
+        const unit = hit.kind === 'unit' && E.getState()?.divisions.find(d => d.id === hit.id);
+        if (hit.kind === 'unit' && !unit) { notify('Подразделение выбыло'); return; }
+        selectedCityId = hit.kind === 'city' ? hit.id : null;
+        selectedCorridorKey = null;
+        if ((shiftHeld || multiSelect) && unit && unit.side === playerSide()) {
+          if (selectedDivIds.has(hit.id)) selectedDivIds.delete(hit.id);
+          else selectedDivIds.add(hit.id);
+        } else {
+          selectedDivIds.clear();
+          if (unit) selectedDivIds.add(hit.id);
+        }
+        currentTab = 'army';
+        renderDom(true);
+        AtlasMap.redrawOverlay();
+      };
+      if (hits.length === 1) pick(hits[0]);
+      else {
+        warDialogTitle.textContent = 'Что выбрать на карте?';
+        warDialogBody.className = 'mapPickList';
+        warDialogBody.replaceChildren(...hits.sort((a,b) => a.distance - b.distance).map(hit => {
+          const button = document.createElement('button');
+          button.className = 'warBtn';
+          button.textContent = (hit.kind === 'city' ? 'Сектор · ' : 'Подразделение · ') + hit.label;
+          button.onclick = () => { warDialog.close(); pick(hit); };
+          return button;
+        }));
+        warDialog.showModal();
       }
-      selectedCityId = null;
-      selectedCorridorKey = null;
-      currentTab = 'army';
-      renderDom(true);
-      AtlasMap.redrawOverlay();
-      return true;
-    }
-
-    let hitCity = null, bestC = 24;
-    for (const m of G.SECTORS) {
-      const [sx, sy] = env.screen(m.x, m.y);
-      const dd = Math.hypot(sx - px, sy - py);
-      if (dd < bestC) { bestC = dd; hitCity = m.id; }
-    }
-    if (hitCity) {
-      selectedCityId = hitCity;
-      selectedCorridorKey = null;
-      selectedDivIds.clear();
-      currentTab = 'army';
-      renderDom(true);
-      AtlasMap.redrawOverlay();
       return true;
     }
 
@@ -1381,7 +1405,7 @@ window.AbkhaziaGame.WarRoom = (() => {
         renderDom(true);
         AtlasMap.redrawOverlay();
       } else if (button.id === 'btnOpenOnlineFromHud') {
-        openOnlineModal();
+        enterOnline();
       } else if (button.id === 'btnScenarios') {
         openScenariosModal();
       }
@@ -1583,7 +1607,14 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (force || fullHtml !== lastSideHtml) {
       lastSideHtml = fullHtml;
       const scroll = sideWar.querySelector('.warBody')?.scrollTop || 0;
+      const focused = sideWar.contains(document.activeElement) ? document.activeElement : null;
       sideWar.innerHTML = fullHtml;
+      if (focused) {
+        const dataKey = Object.keys(focused.dataset)[0];
+        const replacement = focused.id ? document.getElementById(focused.id)
+          : dataKey && [...sideWar.querySelectorAll('button, select, input')].find(el => el.dataset[dataKey] === focused.dataset[dataKey]);
+        replacement?.focus({ preventScroll: true });
+      }
       sideWar.querySelector('.warBody').scrollTop = scroll;
       sideWar.querySelectorAll('[data-wtab]').forEach(b => {
         b.onclick = () => { currentTab = b.dataset.wtab; renderSidePanel(true); };
@@ -1787,7 +1818,7 @@ window.AbkhaziaGame.WarRoom = (() => {
           ${selMine.every(d => E.isTrappedInTkuarchal(d)) ? '<div class="siegeTrapNotice">Гарнизон в блокаде Ткуарчала: наступление и сухопутное пополнение заблокированы. Используйте вылазки ДРГ и вертолётный мост ниже.</div>' : ''}
           ${selMine.some(d => d.supplied === false) && !selMine.every(d => E.isTrappedInTkuarchal(d)) ? '<div class="siegeTrapNotice">Часть дивизий отрезана от снабжения (−28% сила, нет пополнения по суше). Восстановите взорванный мост/путь или используйте вертолётную ротацию!</div>' : ''}
           <div class="cmdGrid">
-            <button type="button" class="warBtn danger" id="btnDivMarch" ${selMine.every(d => E.isTrappedInTkuarchal(d)) ? 'disabled' : ''}>Атака / Марш</button>
+            <button type="button" class="warBtn danger" id="btnDivMarch" ${selMine.every(d => E.isTrappedInTkuarchal(d)) ? 'disabled' : ''}>Переместить</button>
             <button type="button" class="warBtn" id="btnDivEntrench">Держать рубеж</button>
             <button type="button" class="warBtn" id="btnDivRetreat" ${selMine.every(d => E.isTrappedInTkuarchal(d)) ? 'disabled' : ''}>Отступить</button>
             <button type="button" class="warBtn primary" id="btnDivReinforce" ${selMine.every(d => E.isTrappedInTkuarchal(d)) ? 'disabled' : ''}>Пополнить</button>
@@ -1931,6 +1962,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       ${siegeHtml}
       <div class="cmdHeadRow">
         <div class="cmdTitle">Дивизии (${myDivs.length})</div>
+        <button type="button" class="miniLink" id="btnMulti" aria-pressed="${multiSelect}">${multiSelect ? 'Готово (' + selectedDivIds.size + ')' : 'Выбрать несколько'}</button>
         <button type="button" class="miniLink" id="btnSelectAll">Выделить все</button>
       </div>
       <div class="divList">
@@ -2054,8 +2086,10 @@ window.AbkhaziaGame.WarRoom = (() => {
     sideWar.querySelectorAll('[data-opmode]').forEach(b => {
       b.onclick = () => { selectedOpMode = b.dataset.opmode; renderSidePanel(true); };
     });
+    const multi = $('#btnMulti');
+    if (multi) multi.onclick = () => { multiSelect = !multiSelect; renderDom(true); };
     const bm = $('#btnDivMarch');
-    if (bm) bm.onclick = () => { armedAction = { type: 'march' }; renderDom(true); };
+    if (bm) bm.onclick = () => { armMapAction({ type: 'march' }); };
     const be = $('#btnDivEntrench');
     if (be) be.onclick = () => { notify(E.orderDivisionsEntrench([...selectedDivIds]).msg); renderDom(true); };
     const br = $('#btnDivRetreat');
@@ -2082,7 +2116,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     const bRepInf = $('#btnRepairInfra');
     if (bRepInf && selectedCityId) bRepInf.onclick = () => { notify(E.repairCityInfra(mySide, selectedCityId).msg); renderDom(true); AtlasMap.redrawOverlay(); };
     const bAirlift = $('#btnDivAirlift');
-    if (bAirlift) bAirlift.onclick = () => { armedAction = { type: 'airlift' }; renderDom(true); };
+    if (bAirlift) bAirlift.onclick = () => { armMapAction({ type: 'airlift' }); };
     const bi = $('#btnCityInfluence');
     if (bi) bi.onclick = () => { notify(E.crisisInfluence(mySide, selectedCityId).msg); renderDom(true); };
 
@@ -2097,7 +2131,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     sideWar.querySelectorAll('[data-pick-div]').forEach(b => {
       b.onclick = e => {
         const id = b.dataset.pickDiv;
-        if (e.shiftKey) {
+        if (e.shiftKey || multiSelect) {
           if (selectedDivIds.has(id)) selectedDivIds.delete(id);
           else selectedDivIds.add(id);
         } else {
@@ -2115,10 +2149,10 @@ window.AbkhaziaGame.WarRoom = (() => {
     });
 
     sideWar.querySelectorAll('[data-spawn]').forEach(b => {
-      b.onclick = () => { armedAction = { type: 'recruit', unit: b.dataset.spawn }; renderDom(true); };
+      b.onclick = () => { armMapAction({ type: 'recruit', unit: b.dataset.spawn }); };
     });
     sideWar.querySelectorAll('[data-arm-strike]').forEach(b => {
-      b.onclick = () => { armedAction = { type: 'strike', strikeId: b.dataset.armStrike }; renderDom(true); };
+      b.onclick = () => { armMapAction({ type: 'strike', strikeId: b.dataset.armStrike }); };
     });
     sideWar.querySelectorAll('[data-dec]').forEach(b => {
       b.onclick = () => { notify(E.runDecision(mySide, b.dataset.dec).msg); renderDom(true); };
@@ -2251,7 +2285,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (!warDialog.open) warDialog.showModal();
   }
 
-  let guideTab = 'logistics';
+  let guideTab = 'controls';
   function openGuideModal() {
     warDialogTitle.textContent = 'Как играть — Штаб Абхазии';
     warDialogBody.className = 'scenModal';
@@ -2501,6 +2535,48 @@ window.AbkhaziaGame.WarRoom = (() => {
     };
   }
 
+  function armMapAction(action) {
+    armedAction = action;
+    multiSelect = false;
+    if ($('#side').classList.contains('open')) $('#sideClose').click();
+    $('#map').focus({ preventScroll: true });
+    renderDom(true);
+  }
+
+  const commandBar = $('#mapCommand');
+  const commandButton = $('#mapCommandAction');
+  const commandLabel = $('#mapCommandLabel');
+  function renderMapCommand() {
+    const state = E.getState();
+    const own = state.divisions.filter(d => d.side === playerSide());
+    const selected = own.filter(d => selectedDivIds.has(d.id));
+    const candidate = own.find(d => !E.isTrappedInTkuarchal(d)) || own[0];
+    const blocked = selected.length > 0 && selected.every(d => E.isTrappedInTkuarchal(d));
+    commandBar.hidden = !candidate || !!visibleEvent() || state.status === 'finished';
+    if (commandBar.hidden) return;
+    const prompts = { march: 'Выберите точку назначения', recruit: 'Выберите свой город', airlift: 'Выберите площадку', strike: 'Выберите точку на карте' };
+    const label = armedAction ? prompts[armedAction.type] : selected.length > 1 ? 'Выбрано: ' + selected.length
+      : selected[0]?.name || (selectedCityId && G.SECTOR_MAP[selectedCityId]?.name) || 'Выберите подразделение';
+    const action = armedAction ? 'Отменить выбор' : selected.length ? 'Переместить' : 'К подразделению';
+    if (commandLabel.textContent !== label) commandLabel.textContent = label;
+    if (commandButton.textContent !== action) commandButton.textContent = action;
+    commandButton.disabled = !armedAction && (blocked || (selected.length > 0 && state.phase === 'crisis'));
+    if (commandButton.disabled) commandLabel.textContent = blocked ? 'Подразделение в блокаде' : 'Перемещение откроется после кризиса';
+    commandButton.onclick = () => {
+      if (armedAction) { armedAction = null; renderDom(true); }
+      else if (selected.length) armMapAction({ type: 'march' });
+      else {
+        selectedDivIds.clear();
+        selectedDivIds.add(candidate.id);
+        selectedCityId = selectedCorridorKey = null;
+        currentTab = 'army';
+        AtlasMap.flyTo(candidate.x, candidate.y, 1.8);
+        AtlasMap.redrawOverlay();
+        renderDom(true);
+      }
+    };
+  }
+
   function renderDom(force = false) {
     if (!active || !gameEntered) return;
     renderEventModal();
@@ -2513,6 +2589,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (force || now - lastHudRender >= 380) {
       lastHudRender = now;
       renderHud();
+      renderMapCommand();
     }
     if (!interacting && (force || now - lastSideRender >= 950)) {
       lastSideRender = now;
@@ -2707,6 +2784,30 @@ window.AbkhaziaGame.WarRoom = (() => {
     }
   }
 
+  async function enterOnline(restore = false) {
+    const net = G.SupabaseNet;
+    if (!net.isConnected()) {
+      warDialogTitle.textContent = 'Играть вдвоём';
+      warDialogBody.className = 'onlineLoading';
+      warDialogBody.textContent = 'Подключаем онлайн-модуль…';
+      if (!warDialog.open) warDialog.showModal();
+      try {
+        await net.prepareOnline();
+      } catch (error) {
+        if (!warDialog.open || !warDialogBody.classList.contains('onlineLoading')) return;
+        const retry = document.createElement('button');
+        retry.className = 'warBtn';
+        retry.textContent = 'Повторить';
+        retry.onclick = () => enterOnline(restore);
+        warDialogBody.replaceChildren(error.message + ' ', retry);
+        return;
+      }
+      if (!warDialog.open || !warDialogBody.classList.contains('onlineLoading')) return;
+    }
+    openOnlineModal();
+    if (restore && net.isConnected()) restoreOnlineRoom();
+  }
+
   function openOnlineModal() {
     const net = G.SupabaseNet;
     if (!net) { notify('Онлайн-режим недоступен'); return; }
@@ -2752,6 +2853,7 @@ window.AbkhaziaGame.WarRoom = (() => {
         if (join) onlineJoinCode = code;
         const scenario = selectedOnlineScenario();
         withOnlineAction(join ? 'войти в комнату' : 'создать комнату', async () => {
+          const previousState = E.getState();
           const previousRole = E.getRole();
           const previousSpeed = E.getSpeed();
           try {
@@ -2772,6 +2874,7 @@ window.AbkhaziaGame.WarRoom = (() => {
             }
           } catch (error) {
             E.setOnlineMode(null);
+            if (previousState && E.getState() !== previousState) E.applyRemoteState(previousState);
             E.setRole(previousRole);
             E.setSpeed(previousSpeed);
             throw error;
@@ -2818,6 +2921,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (resume) resume.onclick = () => { warDialog.close(); showGame(); };
     const leave = $('#btnLeaveOnline');
     if (leave) leave.onclick = () => {
+      if (!window.confirm('Выйти из комнаты ' + session.roomCode + '? Сохранённый вход на этом устройстве будет удалён.')) return;
       net.leaveRoom();
       E.setOnlineMode(null);
       E.initScenario(E.getState().scenarioId);
@@ -2851,6 +2955,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       syncGuestMotion(sess);
       syncHeaderOnlineBadge();
       if (!sess) return;
+      localSession = false;
       if (!gameEntered) renderEntry();
       if (sess.status === 'active' && sess.prevStatus === 'lobby') {
         E.setOnlineMode(sess.side === 'A' ? 'host' : 'guest', sess.side);
@@ -2873,7 +2978,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     G.SupabaseNet.onSyncError(message => notify('Синхронизация: ' + message));
 
     if (inviteCode) setTimeout(() => {
-      if (!gameEntered && !warDialog.open) openOnlineModal();
+      if (!gameEntered && !warDialog.open) enterOnline();
     }, 350);
   }
 
@@ -2907,7 +3012,7 @@ window.AbkhaziaGame.WarRoom = (() => {
   $('#modeToggle').onclick = showEntry;
 
   const onlineBtn = $('#onlineToggle');
-  if (onlineBtn) onlineBtn.onclick = openOnlineModal;
+  if (onlineBtn) onlineBtn.onclick = () => enterOnline();
 
   const guideBtn = $('#guideToggle');
   if (guideBtn) guideBtn.onclick = openGuideModal;

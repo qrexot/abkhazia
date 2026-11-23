@@ -1625,3 +1625,35 @@ dialog:has(.gameSetup) { width: min(550px, calc(100vw - 24px)); }
   .gameSetup select { font-size: 16px; }
   #modeToggle > span:last-child { display: none; }
 }
+
+.mapCommand {
+  position: absolute;
+  z-index: 5;
+  bottom: max(28px, env(safe-area-inset-bottom));
+  left: 10px;
+  max-width: calc(100% - 72px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 6px 5px 12px;
+  background: var(--surface);
+  color: var(--ink-strong);
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  font-size: 13px;
+}
+.mapCommand span { min-width: 0; overflow-wrap: anywhere; }
+.mapCommand button { flex: none; min-height: 38px; }
+.mapCommand[hidden], .map-entry .mapCommand { display: none; }
+.mapPickList { display: grid; gap: 6px; }
+.mapPickList .warBtn { justify-content: flex-start; min-height: 44px; }
+.onlineLoading { padding: 16px; }
+.marchStatus { bottom: 94px; }
+@media (max-width: 820px) {
+  .mapCommand button { min-height: 44px; }
+  .cmdHeadRow { flex-wrap: wrap; }
+  .cmdHeadRow .miniLink { min-height: 38px; }
+}
+
+.placeDetails { display: grid; justify-items: start; gap: 10px; padding: 14px; }
+.placeDetails small { color: var(--muted); }

@@ -633,13 +633,30 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     onRoomUpdate(null);
   }
 
-  // Auto-connect on load if config exists (from supabase_config.js or localStorage)
-  const initCfg = loadConfig();
-  if (initCfg.url && initCfg.key) {
-    setTimeout(() => connect(initCfg.url, initCfg.key), 0);
+  let sdkRequest;
+  async function prepareOnline() {
+    if (client) return;
+    if (!isSdkAvailable()) {
+      if (!sdkRequest) sdkRequest = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js';
+        script.onload = resolve;
+        script.onerror = () => {
+          script.remove();
+          reject(new Error('Не удалось загрузить онлайн-модуль. Проверьте соединение.'));
+        };
+        document.head.append(script);
+      }).finally(() => { sdkRequest = null; });
+      await sdkRequest;
+    }
+    if (!client) {
+      const cfg = loadConfig();
+      if (cfg.url && cfg.key) connect(cfg.url, cfg.key);
+    }
   }
 
   return {
+    prepareOnline,
     loadConfig,
     saveConfig,
     connect,

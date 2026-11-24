@@ -43,6 +43,9 @@ window.AbkhaziaGame.SupabaseNet = (() => {
   let localSeq = 0;
   let lastAppliedSeq = 0;
   let processedCmdIds = new Set();
+  const waitingCommands = new Map();
+  let recentReceipts = [];
+  let onLateReceipt = () => {};
   let pendingAckIds = new Set();
 
   let onStatusChange = () => {};
@@ -177,6 +180,12 @@ window.AbkhaziaGame.SupabaseNet = (() => {
 
   function resetRoomSync() {
     roomGeneration++;
+    for (const item of waitingCommands.values()) {
+      clearTimeout(item.timer);
+      item.finish({ ok: false, msg: 'Соединение с комнатой закрыто' });
+    }
+    waitingCommands.clear();
+    recentReceipts = [];
     stopHostSyncLoop();
     clearTimeout(pollTimer);
     pollTimer = null;
@@ -290,6 +299,8 @@ window.AbkhaziaGame.SupabaseNet = (() => {
       lastAppliedSeq = Number(row.seq);
       watchMotionKey(row.state_json.motionPublicKey);
       onRemoteSnapshot(row.state_json, row);
+      recentReceipts = row.state_json.marchReceipts || [];
+      for (const item of waitingCommands.values()) reconcileCommand(item);
     }
   }
 
@@ -381,20 +392,42 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     return true;
   }
 
-  async function submitCommand(action, payload) {
+  function reconcileCommand(item) {
+    const receipt = recentReceipts.find(r => r.id === item.id);
+    if (!receipt) return;
+    clearTimeout(item.timer);
+    waitingCommands.delete(item.key);
+    if (item.expired) onLateReceipt(receipt.msg);
+    else item.finish(receipt);
+  }
+
+  function submitCommand(action, payload) {
     if (!client || !session || session.status !== 'active') return { ok: false, msg: 'Матч не активен' };
-    try {
-      const { error, data } = await client.rpc('rpc_submit_command', {
-        p_match_id: session.matchId,
-        p_token: session.token,
-        p_action: action,
-        p_payload: payload || {}
-      });
-      if (error) return { ok: false, msg: error.message };
-      return { ok: true, msg: 'Приказ отправлен штабу', commandId: data == null ? null : String(data) };
-    } catch (e) {
-      return { ok: false, msg: e.message || 'Ошибка сети' };
-    }
+    const key = JSON.stringify([action, payload]);
+    if (waitingCommands.has(key)) return { ok: false, msg: 'Этот приказ уже ожидает подтверждения' };
+    return new Promise(finish => {
+      const item = { key, finish, id: null, expired: false };
+      waitingCommands.set(key, item);
+      item.timer = setTimeout(() => {
+        item.expired = true;
+        finish({ ok: false, msg: 'Итог пока неизвестен. Можно отдать другой приказ. Ответ появится после синхронизации.' });
+      }, 12000);
+      const fail = msg => {
+        if (waitingCommands.get(key) !== item) return;
+        clearTimeout(item.timer);
+        waitingCommands.delete(key);
+        if (item.expired) onLateReceipt(msg);
+        else finish({ ok: false, msg });
+      };
+      Promise.resolve(client.rpc('rpc_submit_command', {
+        p_match_id: session.matchId, p_token: session.token, p_action: action, p_payload: payload || {}
+      })).then(({ error, data }) => {
+        if (waitingCommands.get(key) !== item) return;
+        if (error || data == null) { fail(error?.message || 'Сервер не вернул номер приказа'); return; }
+        item.id = String(data);
+        reconcileCommand(item);
+      }).catch(error => fail(error.message || 'Ошибка сети'));
+    });
   }
 
   function encodeBytes(bytes) {
@@ -681,6 +714,7 @@ window.AbkhaziaGame.SupabaseNet = (() => {
     tryRestoreSession,
     leaveRoom,
     resumeRoom: () => session && subscribeRoom(session),
+    onLateReceipt: fn => { onLateReceipt = fn; },
     onSyncError: fn => { onSyncError = fn; },
     onStatus: fn => { onStatusChange = fn; },
     onCommand: fn => { onRemoteCommand = fn; },

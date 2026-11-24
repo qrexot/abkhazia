@@ -2199,13 +2199,14 @@ window.AbkhaziaGame.Engine = (() => {
     emit();
   }
 
-  function orderDivisionsMarch(divIds, tx, ty, opMode = 'standard', skipOpCost = false) {
+  function orderDivisionsMarch(divIds, tx, ty, opMode = 'standard', skipOpCost = false, preview = false) {
     if (!state || state.status === 'finished') return { ok: false, msg: 'Партия завершена' };
     if (state.phase === 'crisis') return { ok: false, msg: 'Идёт фаза кризиса: войска ждут раскола.' };
     if (!Number.isFinite(tx) || !Number.isFinite(ty)) return { ok: false, msg: 'Укажите точку на карте' };
     const near = nearestSectorMeta(tx, ty);
     let count = 0;
     let downgraded = 0;
+    let paid = 0;
     const rejected = new Set();
     divIds = [...new Set(divIds)];
 
@@ -2261,15 +2262,15 @@ window.AbkhaziaGame.Engine = (() => {
       const fac = state.factions[d.side];
       let applied = opMode;
       if (opMode === 'massive' && !skipOpCost) {
-        if (fac.weapons < 100 || fac.pp < 8) {
+        if (fac.weapons < (preview ? paid + 1 : 1) * 100 || fac.pp < (preview ? paid + 1 : 1) * 8) {
           applied = 'standard';
           downgraded++;
         } else {
-          fac.weapons -= 100;
-          fac.pp -= 8;
+          paid++;
+          if (!preview) { fac.weapons -= 100; fac.pp -= 8; }
         }
       }
-      d.order = {
+      if (!preview) d.order = {
         type: 'march',
         tx: waypoints[waypoints.length - 1].x,
         ty: waypoints[waypoints.length - 1].y,
@@ -2278,12 +2279,12 @@ window.AbkhaziaGame.Engine = (() => {
       };
       count++;
     }
-    emit();
+    if (!preview) emit();
     const total = divIds.length;
     const reasons = rejected.size ? ' · ' + [...rejected].join(', ') : '';
     const standard = downgraded ? ' · стандартный режим: ' + downgraded : '';
     return {
-      ok: count > 0,
+      ok: count > 0, paid, downgraded, skipped: total - count, target: near.name,
       msg: count ? 'Марш к «' + near.name + '» · приказ получен ' + count + ' из ' + total + standard + reasons
         : (rejected.size ? 'Марш недоступен: ' + [...rejected].join(', ') : 'Выберите дивизию')
     };
@@ -2305,23 +2306,25 @@ window.AbkhaziaGame.Engine = (() => {
       const d = state.divisions.find(x => x.id === id);
       if (!d || (d.side !== 'A' && d.side !== 'B')) continue;
       const hubs = G.SECTORS.filter(m => state.cities[m.id].owner === d.side && m.supplyHub);
-      const home = hubs.sort((a, b) => dist(d.x, d.y, a.x, a.y) - dist(d.x, d.y, b.x, b.y))[0];
-      if (!home) continue;
-      const fromSec = nearestSectorMeta(d.x, d.y);
-      const sp = computeSectorPath(fromSec.id, home.id, d.type, d.side, d.type === 'engineering');
-      const wps = [];
-      if (sp && sp.length > 1) {
-        for (let k = 0; k < sp.length - 1; k++) {
-          for (const wp of getCorridorWaypoints(sp[k], sp[k + 1], d.side)) wps.push(wp);
-        }
-      } else {
-        wps.push({ x: home.x, y: home.y, sectorId: home.id, edgeKey: null });
+      const from = nearestSectorMeta(d.x, d.y);
+      let best = null;
+      for (const hub of hubs) {
+        if (isTrappedInTkuarchal(d) && hub.id !== 'tkuarchal') continue;
+        const path = computeSectorPath(from.id, hub.id, d.type, d.side, d.type === 'engineering');
+        if (!path) continue;
+        const points = [];
+        for (let i = 1; i < path.length; i++) points.push(...getCorridorWaypoints(path[i - 1], path[i], d.side));
+        if (path.length === 1) points.push({ x: hub.x, y: hub.y, sectorId: hub.id, edgeKey: null });
+        if (!points.length) continue;
+        const length = polylineLength([d, ...points]);
+        if (!best || length < best.length) best = { hub, points, length };
       }
-      d.order = { type: 'retreat', tx: home.x, ty: home.y, path: wps };
+      if (!best) continue;
+      d.order = { type: 'retreat', tx: best.hub.x, ty: best.hub.y, path: best.points };
       c++;
     }
     emit();
-    return { ok: c > 0, msg: 'Отход к тыловой базе: ' + c + ' див.' };
+    return { ok: c > 0, msg: 'Отход: ' + c + ' из ' + divIds.length + (c < divIds.length ? ' · для остальных нет доступной базы' : '') };
   }
 
   function reinforceDivision(divId) {
@@ -2540,6 +2543,16 @@ window.AbkhaziaGame.Engine = (() => {
   }
 
   // ==================== HIGH COMMAND STRATEGIC DIRECTIVES ====================
+  const directiveCosts = {
+      low:    { wp: 0,   pp: 0,  frac: 0.35, opMode: 'standard', label: 'Экономно (35% сил)' },
+      medium: { wp: 120, pp: 10, frac: 0.60, opMode: 'standard', label: 'Усиленно (60% сил)' },
+      allin:  { wp: 260, pp: 20, frac: 0.85, opMode: 'massive',  label: 'Ва-банк (85% сил)' }
+    };
+
+  function directiveCount(total, effort) {
+    return Math.min(total, Math.max(1, Math.round(total * directiveCosts[effort].frac)));
+  }
+
   function issueDirective(side, dirType, targetCityId, effort = 'medium') {
     if (!state || state.status === 'finished') return { ok: false, msg: 'Партия завершена' };
     if (state.phase === 'crisis') return { ok: false, msg: 'Во время кризиса директивы наступления недоступны' };
@@ -2547,12 +2560,7 @@ window.AbkhaziaGame.Engine = (() => {
     const myDivs = state.divisions.filter(d => d.side === side);
     if (!myDivs.length) return { ok: false, msg: 'Нет боеспособных дивизий' };
 
-    const costs = {
-      low:    { wp: 0,   pp: 0,  frac: 0.35, opMode: 'standard', label: 'Экономно (35% сил)' },
-      medium: { wp: 120, pp: 10, frac: 0.62, opMode: 'standard', label: 'Усиленно (60% сил)' },
-      allin:  { wp: 260, pp: 20, frac: 0.88, opMode: 'massive',  label: 'Ва-банк (85% сил)' }
-    };
-    const cfg = costs[effort] || costs.medium;
+    const cfg = directiveCosts[effort] || directiveCosts.medium;
     if (dirType !== 'hold_line' && (fac.weapons < cfg.wp || fac.pp < cfg.pp)) {
       return { ok: false, msg: 'Нужно ' + cfg.wp + ' ОРУЖ и ' + cfg.pp + ' ПО для «' + cfg.label + '»' };
     }
@@ -2565,18 +2573,21 @@ window.AbkhaziaGame.Engine = (() => {
       .map(id => G.SECTOR_MAP[id])
       .find(m => m && state.cities[m.id].owner === side && m.terrain !== 'high_mountain')) || safeHub;
 
-    for (const d of myDivs) {
-      if (d.type === 'aa') {
-        if (dist(d.x, d.y, safeHub.x, safeHub.y) > 40) orderDivisionsMarch([d.id], safeHub.x, safeHub.y, 'standard', true);
-        else orderDivisionsEntrench([d.id]);
-      } else if (d.type === 'artillery') {
-        if (dist(d.x, d.y, rearSupport.x, rearSupport.y) > 40) orderDivisionsMarch([d.id], rearSupport.x, rearSupport.y, 'standard', true);
-        else orderDivisionsEntrench([d.id]);
+    function positionSupport() {
+      for (const d of myDivs) {
+        if (d.type === 'aa') {
+          if (dist(d.x, d.y, safeHub.x, safeHub.y) > 40) orderDivisionsMarch([d.id], safeHub.x, safeHub.y, 'standard', true);
+          else orderDivisionsEntrench([d.id]);
+        } else if (d.type === 'artillery') {
+          if (dist(d.x, d.y, rearSupport.x, rearSupport.y) > 40) orderDivisionsMarch([d.id], rearSupport.x, rearSupport.y, 'standard', true);
+          else orderDivisionsEntrench([d.id]);
+        }
       }
     }
 
     const combatDivs = myDivs.filter(d => d.type !== 'aa' && d.type !== 'artillery' && !isTrappedInTkuarchal(d));
     if (dirType === 'hold_line') {
+      positionSupport();
       const anchors = frontFriendly.length ? frontFriendly : [safeHub];
       combatDivs.forEach((d, idx) => {
         const anc = anchors[idx % anchors.length];
@@ -2592,18 +2603,23 @@ window.AbkhaziaGame.Engine = (() => {
 
     if (state.ceasefireDaysLeft > 0) return { ok: false, msg: 'Действует перемирие / демаркация (' + state.ceasefireDaysLeft + ' дн.)' };
 
+    if (targetCityId && (!G.SECTOR_MAP[targetCityId] || state.cities[targetCityId].owner === side)) {
+      return { ok: false, msg: 'Цель уже недоступна. Выберите другой город.' };
+    }
     const tgt = (targetCityId && G.SECTOR_MAP[targetCityId] && state.cities[targetCityId].owner !== side)
       ? G.SECTOR_MAP[targetCityId]
       : (frontEnemy.sort((a, b) => b.vp - a.vp)[0] || G.SECTORS.find(m => state.cities[m.id].owner !== side));
     if (!tgt) return { ok: false, msg: 'Нет доступных целей противника' };
 
-    fac.weapons -= cfg.wp;
-    fac.pp -= cfg.pp;
 
     const sorted = [...combatDivs].sort((a, b) => dist(a.x, a.y, tgt.x, tgt.y) - dist(b.x, b.y, tgt.x, tgt.y));
-    const sendCount = Math.max(1, Math.round(sorted.length * cfg.frac));
-    const strikers = sorted.slice(0, sendCount);
-    const reserves = sorted.slice(sendCount);
+    const sendCount = directiveCount(sorted.length, directiveCosts[effort] ? effort : 'medium');
+    const strikers = sorted.filter(d => orderDivisionsMarch([d.id], tgt.x, tgt.y, cfg.opMode, true, true).ok).slice(0, sendCount);
+    if (!strikers.length) return { ok: false, msg: 'Ни одна дивизия не может выступить. Приказ сохранён без изменений.' };
+    const reserves = sorted.filter(d => !strikers.includes(d));
+    fac.weapons -= cfg.wp;
+    fac.pp -= cfg.pp;
+    positionSupport();
 
     let sent = 0;
     for (const d of strikers) {
@@ -2746,14 +2762,13 @@ window.AbkhaziaGame.Engine = (() => {
     if (!myDivs.length) return { ok: false, msg: 'Нет доступных дивизий' };
 
     let chosen = (selectedIds || []).map(id => myDivs.find(d => d.id === id)).filter(Boolean);
-    if (!chosen.length) {
+    const automatic = !chosen.length;
+    if (automatic) {
       const combat = myDivs
         .filter(d => d.type !== 'aa' && d.type !== 'artillery' && !isTrappedInTkuarchal(d) && d.hp > d.maxHp * 0.35)
         .sort((a, b) => dist(a.x, a.y, startPt.x, startPt.y) - dist(b.x, b.y, startPt.x, startPt.y));
       chosen = combat.slice(0, Math.max(2, Math.min(6, Math.round(combat.length * 0.55))));
-      for (const a of myDivs.filter(d => d.type === 'artillery')) {
-        if (dist(a.x, a.y, startPt.x, startPt.y) > 130) orderDivisionsMarch([a.id], startPt.x, startPt.y, 'standard');
-      }
+
     }
     if (!chosen.length) return { ok: false, msg: 'Нет боеспособных дивизий для наступления' };
 
@@ -2769,9 +2784,15 @@ window.AbkhaziaGame.Engine = (() => {
       if (orderDivisionsMarch([d.id], tgt.x, tgt.y, opMode).ok) { sent++; assignedIds.push(d.id); }
     }
 
+    if (!sent) return { ok: false, msg: 'Нет доступного маршрута. Прежняя линия сохранена.' };
+    if (automatic) {
+      for (const a of myDivs.filter(d => d.type === 'artillery')) {
+        if (dist(a.x, a.y, startPt.x, startPt.y) > 130) orderDivisionsMarch([a.id], startPt.x, startPt.y, 'standard');
+      }
+    }
     state.drawnPlans[side] = { points: points.slice(), divIds: assignedIds };
     const tgtCity = nearestSectorMeta(endPt.x, endPt.y).name;
-    const msg = 'Линия наступления к «' + tgtCity + '»: задействовано ' + sent + ' див.';
+    const msg = 'Линия наступления к «' + tgtCity + '»: задействовано ' + sent + ' из ' + chosen.length + (sent < chosen.length ? ' · у остальных нет доступного маршрута' : ' див.');
     setAlert(msg, side); pushFeed(side, 'Линия наступления → ' + tgtCity + ' (' + sent + ' див.)');
     emit();
     return { ok: sent > 0, msg };
@@ -2779,6 +2800,7 @@ window.AbkhaziaGame.Engine = (() => {
 
   function clearDrawnPlan(side) {
     if (state && state.drawnPlans) { state.drawnPlans[side] = null; emit(); }
+    return { ok: true, msg: 'Линия наступления сброшена' };
   }
 
   // ==================== CORRIDOR CHECKPOINTS & MINEFIELDS ====================
@@ -3015,106 +3037,116 @@ window.AbkhaziaGame.Engine = (() => {
     // Strict anti-cheat: Host only accepts remote commands from Guest side 'B'!
     if (side !== 'B') return;
     const p = cmd.payload || {};
-    const ownDivIds = ids => (ids || []).filter(id => state.divisions.some(d => d.id === id && d.side === 'B'));
+    const ownDivIds = ids => (Array.isArray(ids) ? ids : []).filter(id => state.divisions.some(d => d.id === id && d.side === 'B'));
 
+    const id = cmd.id == null ? null : String(cmd.id);
+    if (id && state.marchReceipts?.some(receipt => receipt.id === id)) return;
+    let result;
     switch (cmd.action) {
-      case 'march': {
-        if (cmd.id != null && state.marchReceipts?.some(receipt => receipt.id === String(cmd.id))) break;
-        const result = orderDivisionsMarch(ownDivIds(p.divIds), Number(p.tx), Number(p.ty), p.opMode === 'massive' ? 'massive' : 'standard');
-        if (cmd.id != null) {
-          state.marchReceipts = [...(state.marchReceipts || []), { id: String(cmd.id), ...result }].slice(-20);
-        }
+      case 'march':
+        result = orderDivisionsMarch(ownDivIds(p.divIds), Number(p.tx), Number(p.ty), p.opMode === 'massive' ? 'massive' : 'standard');
         break;
-      }
       case 'entrench':
-        orderDivisionsEntrench(ownDivIds(p.divIds));
+        result = orderDivisionsEntrench(ownDivIds(p.divIds));
         break;
       case 'retreat':
-        orderDivisionsRetreat(ownDivIds(p.divIds));
+        result = orderDivisionsRetreat(ownDivIds(p.divIds));
         break;
       case 'reinforce':
-        for (const id of ownDivIds(p.divIds)) reinforceDivision(id);
+        result = reinforceGroup(ownDivIds(p.divIds));
         break;
       case 'recruit':
-        recruitDivision('B', p.type, p.cityId);
+        result = recruitDivision('B', p.type, p.cityId);
         break;
       case 'airlift':
-        airliftDivisions('B', ownDivIds(p.divIds), p.targetCityId);
+        result = airliftDivisions('B', ownDivIds(p.divIds), p.targetCityId);
         break;
       case 'strike':
-        launchStrike('B', p.strikeType, Number(p.tx), Number(p.ty));
+        result = launchStrike('B', p.strikeType, Number(p.tx), Number(p.ty));
         break;
       case 'decision':
-        runDecision('B', p.decId);
+        result = runDecision('B', p.decId);
         break;
       case 'doctrine':
-        setDoctrine('B', p.docId);
+        result = setDoctrine('B', p.docId);
         break;
       case 'crisis_influence':
-        crisisInfluence('B', p.cityId);
+        result = crisisInfluence('B', p.cityId);
         break;
       case 'improve_sponsor':
-        improveSponsor('B', p.sponsorId);
+        result = improveSponsor('B', p.sponsorId);
         break;
       case 'request_aid':
-        requestAid('B', p.sponsorId, p.pkgId);
+        result = requestAid('B', p.sponsorId, p.pkgId);
         break;
       case 'propose_treaty': {
-        const result = proposeTreaty('B', p.treatyType);
+        result = proposeTreaty('B', p.treatyType);
         if (!result.ok) setAlert(result.msg, 'B');
         break;
       }
       case 'directive':
-        issueDirective('B', p.dirType, p.targetCityId, p.effort);
+        result = issueDirective('B', p.dirType, p.targetCityId, p.effort);
         break;
       case 'drawn_line':
-        executeDrawnLine('B', Array.isArray(p.points) ? p.points.slice(0, 60) : [], ownDivIds(p.selectedIds), p.opMode === 'massive' ? 'massive' : 'standard');
+        result = executeDrawnLine('B', Array.isArray(p.points) ? p.points.slice(0, 60) : [], ownDivIds(p.selectedIds), p.opMode === 'massive' ? 'massive' : 'standard');
         break;
       case 'clear_plan':
-        clearDrawnPlan('B');
+        result = clearDrawnPlan('B');
         break;
       case 'build_checkpoint':
-        buildCheckpoint('B', p.key);
+        result = buildCheckpoint('B', p.key);
         break;
       case 'mine_corridor':
-        mineCorridor('B', p.key);
+        result = mineCorridor('B', p.key);
         break;
       case 'clear_obstacle':
-        clearCorridorEnemyObstacle('B', p.key);
+        result = clearCorridorEnemyObstacle('B', p.key);
         break;
       case 'demolish_corridor':
-        demolishCorridor('B', p.key);
+        result = demolishCorridor('B', p.key);
         break;
       case 'repair_corridor':
-        repairCorridor('B', p.key);
+        result = repairCorridor('B', p.key);
         break;
       case 'repair_infra':
-        repairCityInfra('B', p.cityId);
+        result = repairCityInfra('B', p.cityId);
         break;
       case 'tkuarchal_action':
-        runTkuarchalSiegeAction('B', p.actionId);
+        result = runTkuarchalSiegeAction('B', p.actionId);
         break;
       case 'resolve_event':
-        resolvePendingEvent('B', p.eventKey, p.choiceIdx);
+        result = resolvePendingEvent('B', p.eventKey, p.choiceIdx);
         break;
       default:
         return;
+    }
+    if (id && result) {
+      const receipt = { id, action: cmd.action, ok: !!result.ok, msg: result.msg || 'Решение принято' };
+      if (result.division) receipt.division = { id: result.division.id };
+      state.marchReceipts = [...(state.marchReceipts || []), receipt].slice(-128);
     }
     if (G.SupabaseNet && G.SupabaseNet.isHost()) {
       G.SupabaseNet.pushSnapshot(state, true);
     }
   }
 
-  function sendGuestCmd(action, payload) {
-    if (G.SupabaseNet) G.SupabaseNet.submitCommand(action, payload);
-    return { ok: true, msg: 'Приказ передан по защищённому каналу…' };
+  function reinforceGroup(ids) {
+    const reasons = new Map();
+    let count = 0;
+    for (const id of new Set(ids)) {
+      const result = reinforceDivision(id);
+      if (result.ok) count++;
+      else reasons.set(result.msg, (reasons.get(result.msg) || 0) + 1);
+    }
+    const detail = [...reasons].map(([reason, n]) => reason + ' (' + n + ')');
+    return { ok: count > 0, msg: ['Пополнено: ' + count + ' из ' + ids.length, ...detail].join(' · ') };
   }
 
   function proxyCmd(action, buildPayload, localFn) {
     return function(...args) {
       if (onlineMode && !G.SupabaseNet?.isOnlineMatch()) return { ok: false, msg: 'Дождитесь начала онлайн-матча' };
       if (onlineMode === 'guest') {
-        return sendGuestCmd(action, buildPayload(...args));
+        return G.SupabaseNet.submitCommand(action, buildPayload(...args));
       }
       const res = localFn(...args);
       if (onlineMode === 'host' && res && res.ok && G.SupabaseNet) {
@@ -3173,6 +3205,9 @@ window.AbkhaziaGame.Engine = (() => {
     },
     orderDivisionsEntrench: proxyCmd('entrench', (divIds) => ({ divIds }), orderDivisionsEntrench),
     orderDivisionsRetreat: proxyCmd('retreat', (divIds) => ({ divIds }), orderDivisionsRetreat),
+    previewMarch: (ids, x, y, mode) => orderDivisionsMarch(ids, x, y, mode, false, true),
+    directiveCount,
+    reinforceGroup: proxyCmd('reinforce', divIds => ({ divIds }), reinforceGroup),
     reinforceDivision: proxyCmd('reinforce', (divId) => ({ divIds: [divId] }), reinforceDivision),
     recruitDivision: proxyCmd('recruit', (side, type, cityId) => ({ type, cityId }), recruitDivision),
     launchStrike: proxyCmd('strike', (side, strikeType, tx, ty) => ({ strikeType, tx, ty }), launchStrike),

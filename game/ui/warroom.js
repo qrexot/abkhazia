@@ -205,6 +205,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     $('#gameSetupForm').onsubmit = event => {
       event.preventDefault();
       const role = $('#setupRole').value;
+      dirTargetId = '';
       localSession = true;
       multiSelect = false;
       resetMarchStatus();
@@ -232,51 +233,53 @@ window.AbkhaziaGame.WarRoom = (() => {
   }
 
   function resetMarchStatus() {
-    clearTimeout(pendingMarch?.timer);
     pendingMarch = null;
     setMarchStatus('', '');
   }
 
-  function resolveMarchReceipt() {
-    if (!pendingMarch?.id) return;
-    const result = E.getState()?.marchReceipts?.find(receipt => receipt.id === pendingMarch.id);
-    if (!result) return;
-    const updateTarget = pendingMarch.updateTarget;
-    resetMarchStatus();
-    setMarchStatus(result.msg + (result.ok && !E.getSpeed() ? ' · Игра на паузе' : ''), result.ok ? 'done' : 'error');
-    updateTarget?.(result.ok);
-  }
-
   async function submitMarch(ids, x, y, selectingTarget = false) {
-    if (pendingMarch) { notify('Предыдущий приказ ещё ожидает подтверждения'); return; }
+    if (pendingMarch) { notify('Предыдущий марш ожидает ответа'); return; }
+    if (selectedOpMode === 'massive') {
+      const preview = E.previewMarch(ids, x, y, selectedOpMode);
+      if (!preview.ok) { setMarchStatus(preview.msg, 'error'); return; }
+      if (!window.confirm('Марш к «' + preview.target + '»\nПрорыв: ' + preview.paid +
+        ' · Обычный марш: ' + preview.downgraded + ' · Останутся: ' + preview.skipped +
+        '\nРасход: ' + preview.paid * 100 + ' ОР и ' + preview.paid * 8 + ' ПО. Отдать приказ?')) return;
+    }
     const action = armedAction;
-    const updateTarget = ok => {
-      if (ok && selectingTarget && armedAction === action) armedAction = null;
-      renderDom(true);
-    };
     const ticket = {};
     pendingMarch = ticket;
-    if (E.getOnlineMode() === 'guest') setMarchStatus('Отправляем приказ…', 'waiting');
-    let result;
+    if (E.getOnlineMode() === 'guest') setMarchStatus('Ожидаем ответа ведущего…', 'waiting');
+    const result = await E.submitMarch(ids, x, y, selectedOpMode);
+    if (ticket !== pendingMarch) return;
+    resetMarchStatus();
+    setMarchStatus(result.msg + (result.ok && !E.getSpeed() ? ' · Игра на паузе' : ''), result.ok ? 'done' : 'error');
+    if (result.ok && selectingTarget && armedAction === action) armedAction = null;
+    renderDom(true);
+  }
+
+  async function reportOrder(result) {
+    if (result && typeof result.then === 'function') notify('Ожидаем ответа ведущего…');
+    const outcome = await result;
+    notify(outcome.msg);
+    return outcome;
+  }
+
+  async function finishMapOrder(action, result) {
+    if (action.busy) return;
+    action.busy = true;
     try {
-      result = await E.submitMarch(ids, x, y, selectedOpMode);
-    } catch {
-      result = { ok: false, msg: 'Не удалось отправить приказ. Проверьте соединение.' };
+      const outcome = await reportOrder(result);
+      if (armedAction !== action || !outcome.ok) return;
+      if (outcome.division) {
+        selectedDivIds.clear();
+        selectedDivIds.add(outcome.division.id);
+      }
+      armedAction = null;
+    } finally {
+      action.busy = false;
+      renderDom(true);
     }
-    if (pendingMarch !== ticket) return;
-    if (!result.commandId) {
-      resetMarchStatus();
-      setMarchStatus(result.msg + (result.ok && !E.getSpeed() ? ' · Игра на паузе' : ''), result.ok ? 'done' : 'error');
-      updateTarget(result.ok);
-      return;
-    }
-    ticket.id = result.commandId;
-    ticket.updateTarget = updateTarget;
-    ticket.timer = setTimeout(() => {
-      setMarchStatus('Сервер получил приказ. Подтверждение от хоста ещё не пришло.', 'waiting');
-    }, 8000);
-    setMarchStatus('Сервер получил приказ. Ждём подтверждения хоста…', 'waiting');
-    resolveMarchReceipt();
   }
 
   function bootGame() {
@@ -342,7 +345,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       document.body.classList.remove('draw-line-mode');
       const mySide = playerSide();
       if (mySide && draftLineWorld.length >= 2) {
-        notify(E.executeDrawnLine(mySide, draftLineWorld, [...selectedDivIds], selectedOpMode).msg);
+        reportOrder(E.executeDrawnLine(mySide, draftLineWorld, [...selectedDivIds], selectedOpMode));
       }
       draftLineWorld = [];
       renderDom(true);
@@ -941,6 +944,10 @@ window.AbkhaziaGame.WarRoom = (() => {
         ctx.strokeStyle = '#ef4444'; ctx.stroke();
       }
 
+      if (armedAction?.type === 'recruit' && canRecruitAt(st, playerSide(), m.id, armedAction.unit)) {
+        ctx.beginPath(); ctx.arc(x, y, sz + 11, 0, Math.PI * 2);
+        ctx.strokeStyle = '#8be9cc'; ctx.lineWidth = 3; ctx.stroke();
+      }
       if (selectedCityId === m.id) {
         ctx.beginPath(); ctx.arc(x, y, sz + 5, 0, Math.PI * 2);
         ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 1.8; ctx.stroke();
@@ -1267,6 +1274,12 @@ window.AbkhaziaGame.WarRoom = (() => {
     if (guestMatchId && guestMotion.needsFrame(time)) AtlasMap.redrawOverlay();
   }
 
+  function canRecruitAt(st, side, id, type) {
+    const fac = st.factions[side], unit = G.UNIT_TEMPLATES[type];
+    return st.cities[id].owner === side && !(id === 'tkuarchal' && st.tkuarchalSiege?.active) &&
+      fac && unit && fac.manpower >= unit.costMp && fac.weapons >= unit.costWp;
+  }
+
   function handleLeftClick(px, py, env) {
     const st = E.getState();
     if (!active || !gameEntered || !st) return false;
@@ -1274,6 +1287,7 @@ window.AbkhaziaGame.WarRoom = (() => {
     const [wx, wy] = env.world(px, py);
 
     if (armedAction && mySide) {
+      if (armedAction.busy) return true;
       if (armedAction.type === 'march') {
         const mine = [...selectedDivIds].filter(id => st.divisions.some(d => d.id === id && d.side === mySide));
         submitMarch(mine, wx, wy, true);
@@ -1281,27 +1295,24 @@ window.AbkhaziaGame.WarRoom = (() => {
       }
       if (armedAction.type === 'strike') {
         const result = E.launchStrike(mySide, armedAction.strikeId, wx, wy);
-        notify(result.msg);
-        if (result.ok) armedAction = null;
-        renderDom(true);
+        finishMapOrder(armedAction, result);
         return true;
       }
       if (armedAction.type === 'recruit') {
         const near = E.nearestSectorMeta(wx, wy);
-        const res = E.recruitDivision(mySide, armedAction.unit, near.id);
-        notify(res.msg);
-        if (res.ok && res.division) { selectedDivIds.clear(); selectedDivIds.add(res.division.id); }
-        if (res.ok) armedAction = null;
-        renderDom(true);
+        const [cx, cy] = env.screen(near.x, near.y);
+        if (Math.hypot(px - cx, py - cy) > 24 || !canRecruitAt(st, mySide, near.id, armedAction.unit)) {
+          notify('Нажмите на подсвеченный город, чтобы развернуть дивизию');
+          return true;
+        }
+        finishMapOrder(armedAction, E.recruitDivision(mySide, armedAction.unit, near.id));
         return true;
       }
       if (armedAction.type === 'airlift') {
         const near = E.nearestSectorMeta(wx, wy);
         const mine = [...selectedDivIds].filter(id => st.divisions.some(d => d.id === id && d.side === mySide));
         const result = E.airliftDivisions(mySide, mine, near.id);
-        notify(result.msg);
-        if (result.ok) armedAction = null;
-        renderDom(true);
+        finishMapOrder(armedAction, result);
         return true;
       }
     }
@@ -1813,7 +1824,7 @@ window.AbkhaziaGame.WarRoom = (() => {
           </div>
           <div class="opModeGroup two">
             <button type="button" class="opModeBtn ${selectedOpMode === 'standard' ? 'active' : ''}" data-opmode="standard"><strong>Стандарт</strong><small>0 доп. затрат</small></button>
-            <button type="button" class="opModeBtn ${selectedOpMode === 'massive' ? 'active' : ''}" data-opmode="massive"><strong>Прорыв (+35%)</strong><small>−100 ОР · −8 ПО</small></button>
+            <button type="button" class="opModeBtn ${selectedOpMode === 'massive' ? 'active' : ''}" data-opmode="massive"><strong>Прорыв (+35%)</strong><small>100 ОР · 8 ПО за дивизию</small></button>
           </div>
           ${selMine.every(d => E.isTrappedInTkuarchal(d)) ? '<div class="siegeTrapNotice">Гарнизон в блокаде Ткуарчала: наступление и сухопутное пополнение заблокированы. Используйте вылазки ДРГ и вертолётный мост ниже.</div>' : ''}
           ${selMine.some(d => d.supplied === false) && !selMine.every(d => E.isTrappedInTkuarchal(d)) ? '<div class="siegeTrapNotice">Часть дивизий отрезана от снабжения (−28% сила, нет пополнения по суше). Восстановите взорванный мост/путь или используйте вертолётную ротацию!</div>' : ''}
@@ -1889,7 +1900,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       `;
     } else {
       const enemyOpts = G.SECTORS.filter(m => st.cities[m.id].owner !== mySide).sort((a, b) => b.vp - a.vp);
-      if (!dirTargetId || !enemyOpts.some(m => m.id === dirTargetId)) dirTargetId = enemyOpts[0]?.id || '';
+      const combatCount = myDivs.filter(d => d.type !== 'aa' && d.type !== 'artillery' && !E.isTrappedInTkuarchal(d)).length;
       const activeDir = st.factions[mySide].activeDirective;
       const isPvp = E.getRole() === 'pvp';
       const hasPlan = !!(st.drawnPlans && st.drawnPlans[mySide]);
@@ -1941,13 +1952,15 @@ window.AbkhaziaGame.WarRoom = (() => {
             <label class="dirField">
               <span>Целевой сектор</span>
               <select id="dirTargetSel">
+                <option value="" ${!dirTargetId ? 'selected' : ''}>Автовыбор цели</option>
+                ${dirTargetId && !enemyOpts.some(m => m.id === dirTargetId) ? '<option selected disabled>Цель недоступна · выберите другую</option>' : ''}
                 ${enemyOpts.map(m => `<option value="${m.id}" ${m.id === dirTargetId ? 'selected' : ''}>${m.name} (${m.vp} ОП)</option>`).join('')}
               </select>
             </label>
             <div class="dirEffortGrid">
-              <button type="button" class="effBtn ${dirEffort === 'low' ? 'active' : ''}" data-deff="low"><strong>35% сил</strong><small>0 затрат</small></button>
-              <button type="button" class="effBtn ${dirEffort === 'medium' ? 'active' : ''}" data-deff="medium"><strong>60% сил</strong><small>−120 ОР · 10 ПО</small></button>
-              <button type="button" class="effBtn ${dirEffort === 'allin' ? 'active' : ''}" data-deff="allin"><strong>85% сил</strong><small>−260 ОР · 20 ПО</small></button>
+              <button type="button" class="effBtn ${dirEffort === 'low' ? 'active' : ''}" data-deff="low" ${dirType === 'all_in' ? 'disabled' : ''}><strong>${E.directiveCount(combatCount, 'low')} из ${combatCount} · 35%</strong><small>0 затрат</small></button>
+              <button type="button" class="effBtn ${dirEffort === 'medium' ? 'active' : ''}" data-deff="medium" ${dirType === 'all_in' ? 'disabled' : ''}><strong>${E.directiveCount(combatCount, 'medium')} из ${combatCount} · 60%</strong><small>−120 ОР · 10 ПО</small></button>
+              <button type="button" class="effBtn ${dirEffort === 'allin' ? 'active' : ''}" data-deff="allin"><strong>${E.directiveCount(combatCount, 'allin')} из ${combatCount} · 85%</strong><small>−260 ОР · 20 ПО</small></button>
             </div>
           ` : ''}
           <button type="button" class="warBtn primary full" id="btnExecDirective">Утвердить приказ Ставки</button>
@@ -1981,9 +1994,9 @@ window.AbkhaziaGame.WarRoom = (() => {
       <div class="cmdTitle">Сформировать дивизию (8 классов)</div>
       <div class="recruitList">
         ${Object.values(G.UNIT_TEMPLATES).map(u => `
-          <button type="button" class="recruitRow" data-spawn="${u.id}" title="${u.desc}">
+          <button type="button" class="recruitRow" data-spawn="${u.id}" title="${u.desc}" ${st.factions[mySide].manpower < u.costMp || st.factions[mySide].weapons < u.costWp ? 'disabled' : ''}>
             <span><strong>${u.name}</strong><small>${u.role} · ${u.costMp} Л/С · ${u.costWp} ОРУЖ</small></span>
-            <span class="addTag">+</span>
+            <span class="addTag">${st.factions[mySide].manpower < u.costMp || st.factions[mySide].weapons < u.costWp ? 'Нет ресурсов' : '+'}</span>
           </button>
         `).join('')}
       </div>
@@ -2091,34 +2104,32 @@ window.AbkhaziaGame.WarRoom = (() => {
     const bm = $('#btnDivMarch');
     if (bm) bm.onclick = () => { armMapAction({ type: 'march' }); };
     const be = $('#btnDivEntrench');
-    if (be) be.onclick = () => { notify(E.orderDivisionsEntrench([...selectedDivIds]).msg); renderDom(true); };
+    if (be) be.onclick = () => { reportOrder(E.orderDivisionsEntrench([...selectedDivIds])); renderDom(true); };
     const br = $('#btnDivRetreat');
-    if (br) br.onclick = () => { notify(E.orderDivisionsRetreat([...selectedDivIds]).msg); renderDom(true); };
+    if (br) br.onclick = () => { reportOrder(E.orderDivisionsRetreat([...selectedDivIds])); renderDom(true); };
     const bf = $('#btnDivReinforce');
     if (bf) bf.onclick = () => {
-      let ok = 0;
-      for (const id of selectedDivIds) if (E.reinforceDivision(id).ok) ok++;
-      notify(ok ? ('Пополнено дивизий: ' + ok) : 'Недостаточно ресурсов или дивизии укомплектованы');
+      reportOrder(E.reinforceGroup([...selectedDivIds]));
       renderDom(true);
     };
     const bCloseC = $('#btnCloseCorr');
     if (bCloseC) bCloseC.onclick = () => { selectedCorridorKey = null; renderDom(true); AtlasMap.redrawOverlay(); };
     const bCp = $('#btnBuildCp');
-    if (bCp && selectedCorridorKey) bCp.onclick = () => { notify(E.buildCheckpoint(mySide, selectedCorridorKey).msg); renderDom(true); AtlasMap.redrawOverlay(); };
+    if (bCp && selectedCorridorKey) bCp.onclick = () => { reportOrder(E.buildCheckpoint(mySide, selectedCorridorKey)); renderDom(true); AtlasMap.redrawOverlay(); };
     const bMn = $('#btnMineCorr');
-    if (bMn && selectedCorridorKey) bMn.onclick = () => { notify(E.mineCorridor(mySide, selectedCorridorKey).msg); renderDom(true); AtlasMap.redrawOverlay(); };
+    if (bMn && selectedCorridorKey) bMn.onclick = () => { reportOrder(E.mineCorridor(mySide, selectedCorridorKey)); renderDom(true); AtlasMap.redrawOverlay(); };
     const bClrO = $('#btnClearObs');
-    if (bClrO && selectedCorridorKey) bClrO.onclick = () => { notify(E.clearCorridorEnemyObstacle(mySide, selectedCorridorKey).msg); renderDom(true); AtlasMap.redrawOverlay(); };
+    if (bClrO && selectedCorridorKey) bClrO.onclick = () => { reportOrder(E.clearCorridorEnemyObstacle(mySide, selectedCorridorKey)); renderDom(true); AtlasMap.redrawOverlay(); };
     const bDem = $('#btnDemolishCorr');
-    if (bDem && selectedCorridorKey) bDem.onclick = () => { notify(E.demolishCorridor(mySide, selectedCorridorKey).msg); renderDom(true); AtlasMap.redrawOverlay(); };
+    if (bDem && selectedCorridorKey) bDem.onclick = () => { reportOrder(E.demolishCorridor(mySide, selectedCorridorKey)); renderDom(true); AtlasMap.redrawOverlay(); };
     const bRepC = $('#btnRepairCorr');
-    if (bRepC && selectedCorridorKey) bRepC.onclick = () => { notify(E.repairCorridor(mySide, selectedCorridorKey).msg); renderDom(true); AtlasMap.redrawOverlay(); };
+    if (bRepC && selectedCorridorKey) bRepC.onclick = () => { reportOrder(E.repairCorridor(mySide, selectedCorridorKey)); renderDom(true); AtlasMap.redrawOverlay(); };
     const bRepInf = $('#btnRepairInfra');
-    if (bRepInf && selectedCityId) bRepInf.onclick = () => { notify(E.repairCityInfra(mySide, selectedCityId).msg); renderDom(true); AtlasMap.redrawOverlay(); };
+    if (bRepInf && selectedCityId) bRepInf.onclick = () => { reportOrder(E.repairCityInfra(mySide, selectedCityId)); renderDom(true); AtlasMap.redrawOverlay(); };
     const bAirlift = $('#btnDivAirlift');
     if (bAirlift) bAirlift.onclick = () => { armMapAction({ type: 'airlift' }); };
     const bi = $('#btnCityInfluence');
-    if (bi) bi.onclick = () => { notify(E.crisisInfluence(mySide, selectedCityId).msg); renderDom(true); };
+    if (bi) bi.onclick = () => { reportOrder(E.crisisInfluence(mySide, selectedCityId)); renderDom(true); };
 
     const selAll = $('#btnSelectAll');
     if (selAll) selAll.onclick = () => {
@@ -2155,21 +2166,21 @@ window.AbkhaziaGame.WarRoom = (() => {
       b.onclick = () => { armMapAction({ type: 'strike', strikeId: b.dataset.armStrike }); };
     });
     sideWar.querySelectorAll('[data-dec]').forEach(b => {
-      b.onclick = () => { notify(E.runDecision(mySide, b.dataset.dec).msg); renderDom(true); };
+      b.onclick = () => { reportOrder(E.runDecision(mySide, b.dataset.dec)); renderDom(true); };
     });
     sideWar.querySelectorAll('[data-doc]').forEach(b => {
-      b.onclick = () => { notify(E.setDoctrine(mySide, b.dataset.doc).msg); renderDom(true); };
+      b.onclick = () => { reportOrder(E.setDoctrine(mySide, b.dataset.doc)); renderDom(true); };
     });
     sideWar.querySelectorAll('[data-tr]').forEach(b => {
-      b.onclick = () => { notify(E.proposeTreaty(mySide, b.dataset.tr).msg); renderDom(true); };
+      b.onclick = () => { reportOrder(E.proposeTreaty(mySide, b.dataset.tr)); renderDom(true); };
     });
     sideWar.querySelectorAll('[data-imp]').forEach(b => {
-      b.onclick = () => { notify(E.improveSponsor(mySide, b.dataset.imp).msg); renderDom(true); };
+      b.onclick = () => { reportOrder(E.improveSponsor(mySide, b.dataset.imp)); renderDom(true); };
     });
     sideWar.querySelectorAll('[data-aid]').forEach(b => {
       b.onclick = () => {
         const [sp, pk] = b.dataset.aid.split(':');
-        notify(E.requestAid(mySide, sp, pk).msg);
+        reportOrder(E.requestAid(mySide, sp, pk));
         renderDom(true);
       };
     });
@@ -2194,15 +2205,15 @@ window.AbkhaziaGame.WarRoom = (() => {
       renderDom(true);
     };
     const bClr = $('#btnClearPlan');
-    if (bClr) bClr.onclick = () => { E.clearDrawnPlan(mySide); notify('Линия наступления сброшена'); renderDom(true); };
+    if (bClr) bClr.onclick = () => { reportOrder(E.clearDrawnPlan(mySide)); renderDom(true); };
     const bExec = $('#btnExecDirective');
     if (bExec) bExec.onclick = () => {
-      notify(E.issueDirective(mySide, dirType, dirTargetId, dirType === 'all_in' ? 'allin' : dirEffort).msg);
+      reportOrder(E.issueDirective(mySide, dirType, dirTargetId, dirType === 'all_in' ? 'allin' : dirEffort));
       renderDom(true);
     };
     sideWar.querySelectorAll('[data-siege]').forEach(b => {
       b.onclick = () => {
-        notify(E.runTkuarchalSiegeAction(mySide, b.dataset.siege).msg);
+        reportOrder(E.runTkuarchalSiegeAction(mySide, b.dataset.siege));
         renderDom(true);
       };
     });
@@ -2944,7 +2955,6 @@ window.AbkhaziaGame.WarRoom = (() => {
       const speed = roomRow.status === 'active' ? roomRow.speed : 0;
       seedGuestMotion(snap, speed);
       E.applyRemoteState(snap, { ...roomRow, speed });
-      resolveMarchReceipt();
     });
     G.SupabaseNet.onMotion(frame => {
       if (!guestMatchId) return;
@@ -2975,6 +2985,7 @@ window.AbkhaziaGame.WarRoom = (() => {
       }
     });
     G.SupabaseNet.onStatus(() => syncHeaderOnlineBadge());
+    G.SupabaseNet.onLateReceipt(notify);
     G.SupabaseNet.onSyncError(message => notify('Синхронизация: ' + message));
 
     if (inviteCode) setTimeout(() => {
